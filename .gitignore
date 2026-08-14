@@ -1,0 +1,8 @@
+target/
+*.log
+docs/superpowers/
+.superpowers/
+.cargo-home/
+.cargo/
+vendor/
+tools/*.js

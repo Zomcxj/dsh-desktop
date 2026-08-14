@@ -1,0 +1,13 @@
+[package]
+name = "dsh-desktop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tao = "0.36"
+wry = "0.56"
+tray-icon = "0.24"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+winres = "0.1"
