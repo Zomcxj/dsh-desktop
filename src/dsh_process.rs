@@ -17,9 +17,6 @@ pub struct DshProcess {
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[cfg(windows)]
-const DETACHED_PROCESS: u32 = 0x0000_0008;
-
 impl DshProcess {
     pub fn spawn_dsh_web() -> std::io::Result<Self> {
         #[cfg(windows)]
@@ -69,8 +66,14 @@ impl DshProcess {
         }
 
         if let Some(pid) = self.pid {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
+            let mut command = Command::new("taskkill");
+            command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
+            let _ = command
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -138,8 +141,10 @@ fn npm_global_root() -> Option<PathBuf> {
     // Windows 上 npm 是 .cmd shim，CreateProcess 无法直接启动，需经 cmd /c
     #[cfg(windows)]
     let mut command = {
+        use std::os::windows::process::CommandExt;
         let mut c = Command::new("cmd");
         c.args(["/C", "npm", "root", "-g"]);
+        c.creation_flags(CREATE_NO_WINDOW);
         c
     };
     #[cfg(not(windows))]
@@ -167,7 +172,7 @@ fn npm_global_root() -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn node_launch_flags() -> u32 {
-    CREATE_NO_WINDOW | DETACHED_PROCESS
+    CREATE_NO_WINDOW
 }
 
 fn child_exited_before_ready(stderr: &str) -> String {
@@ -247,8 +252,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn node_launch_detaches_from_the_console() {
-        assert_eq!(node_launch_flags() & DETACHED_PROCESS, DETACHED_PROCESS);
+    fn node_launch_runs_without_a_console_window() {
+        assert_eq!(node_launch_flags(), CREATE_NO_WINDOW);
     }
 
     #[test]

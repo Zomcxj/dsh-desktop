@@ -44,6 +44,7 @@ pub fn close_tcp_listeners(port: u16) -> Result<(), String> {
         .args(["-ano", "-p", "tcp"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("读取 TCP 监听端口失败: {error}"))?;
     if !output.status.success() {
