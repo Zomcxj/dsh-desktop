@@ -6,43 +6,17 @@
 
 ## 功能
 
-- 每次启动时结束监听本机 TCP 端口 3080 的进程，再后台启动 dsh Web 服务（默认 `http://127.0.0.1:3080`）
-- 系统托盘常驻，右键可退出；关闭主窗口时隐藏到托盘
-- 主窗口可缩放，最小尺寸为 800x600
-- 通过 `npm root -g` 自动定位 `@deepseek-ai/dsh`，并回退到 `%APPDATA%\npm`
-- 启动时自动检查运行环境（Node.js / npm / dsh）并显示版本，未安装时提供安装命令与自动安装按钮
-- 启动时自动检查 dsh 新版本，发现更新则自动安装后再启动
-- 界面导航栏提供"重启服务"，可停止并重新启动 dsh Web 服务
+- 后台启动 dsh Web 服务（`http://127.0.0.1:3080`），启动前自动关闭占用该端口的进程
+- 启动时自动检查运行环境（Node.js / npm / dsh），未安装可一键自动安装；dsh 有新版时自动更新
+- 系统托盘常驻，关闭主窗口隐藏到托盘；导航栏可刷新页面、重启服务、切换退出/托盘模式
 
 ## 使用
 
-1. 安装 Node.js（含 npm），并确保 `node` 可从 `PATH` 使用。
-2. 通过 npm 全局安装最新版 dsh：
+1. 安装 Node.js（含 npm），并确保 `node` 在 `PATH` 中。
+2. 全局安装 dsh：`npm install -g @deepseek-ai/dsh`
+3. 运行 `cargo build --release`，启动 `target/release/dsh-desktop.exe`。
 
-   ```powershell
-   npm install -g @deepseek-ai/dsh
-   ```
-
-3. 运行 `cargo build --release`。
-4. 启动 `target/release/dsh-desktop.exe`。
-
-## 环境检查
-
-启动时会依次检查以下环境，面板实时显示检查进度与结果：
-
-- **Node.js**：未安装时可点击"自动安装"（通过 winget 安装 LTS 版），或按提示手动安装
-- **npm**：随 Node.js 一起安装，无需单独处理
-- **dsh (@deepseek-ai/dsh)**：未安装时可点击"自动安装"（`npm install -g @deepseek-ai/dsh`），或按提示手动安装
-
-全部通过后才会启动 dsh Web 服务；任一项未安装会停留在检查面板，安装完成后点击"重试"继续。
-
-### 自动更新
-
-dsh 已安装时，启动过程会通过 `npm view @deepseek-ai/dsh version` 对比远程版本。发现新版本会自动执行 `npm install -g @deepseek-ai/dsh` 更新后再启动；网络不可用时静默跳过，不阻塞启动。
-
-### 重启服务
-
-导航栏的"重启服务"按钮会停止当前 dsh Web 服务并回到启动页重新执行环境检查与启动流程。
+> 环境检查未通过时会停留在检查面板，安装完成后点击"重试"继续；重启服务会回到启动页重新执行检查与启动流程。
 
 ## 说明
 
