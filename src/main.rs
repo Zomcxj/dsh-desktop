@@ -3,6 +3,7 @@
 mod bootstrap;
 mod checker;
 mod dsh_process;
+mod env_check;
 mod splash;
 
 use std::path::{Path, PathBuf};
@@ -33,6 +34,9 @@ enum UserEvent {
     ToggleTray,
     PageLoaded(String),
     InjectNavbar,
+    InstallNode,
+    InstallDsh,
+    InstallFinished(&'static str, bool),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -199,9 +203,12 @@ fn main() -> wry::Result<()> {
                 {
                     process.stop();
                 }
+                // 回到启动页，让用户看到重启过程
+                let _ = desktop
+                    .webview
+                    .load_html(&build_splash_html());
                 // 重新启动
                 if let Some(generation) = bootstrap_state.start() {
-                    let _ = desktop.webview.evaluate_script("reset();");
                     launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
                 }
             }
@@ -234,6 +241,52 @@ fn main() -> wry::Result<()> {
             }
             Event::UserEvent(UserEvent::InjectNavbar) => {
                 inject_navbar_to_desktop(&desktop, &settings_clone);
+            }
+            Event::UserEvent(UserEvent::InstallNode) => {
+                let install_proxy = event_proxy.clone();
+                std::thread::spawn(move || {
+                    let ok = run_install_command(
+                        "winget",
+                        &[
+                            "install",
+                            "OpenJS.NodeJS.LTS",
+                            "--silent",
+                            "--accept-package-agreements",
+                            "--accept-source-agreements",
+                        ],
+                    );
+                    let _ = install_proxy.send_event(UserEvent::InstallFinished("node", ok));
+                });
+            }
+            Event::UserEvent(UserEvent::InstallDsh) => {
+                // 先停掉正在运行的 dsh web 进程，释放被锁定的原生 DLL，否则 npm 无法覆盖安装
+                if let Some(process) = managed_process
+                    .lock()
+                    .expect("managed process lock poisoned")
+                    .take()
+                {
+                    process.stop();
+                }
+                let install_proxy = event_proxy.clone();
+                std::thread::spawn(move || {
+                    let ok = run_install_command("npm", &["install", "-g", "@deepseek-ai/dsh"]);
+                    let _ = install_proxy.send_event(UserEvent::InstallFinished("dsh", ok));
+                });
+            }
+            Event::UserEvent(UserEvent::InstallFinished(which, success)) => {
+                if success {
+                    // 自动重新检查环境并继续启动
+                    if let Some(generation) = bootstrap_state.start() {
+                        let _ = desktop.webview.evaluate_script("reset();");
+                        launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
+                    }
+                } else {
+                    let msg = format!("{which} 安装失败，请按安装方式手动安装后重试");
+                    let _ = desktop.webview.evaluate_script(&format!("setStatus({msg:?});"));
+                    let _ = desktop.webview.evaluate_script(
+                        "var b=document.querySelector('.env-btn[disabled]');if(b){b.disabled=false;b.textContent='自动安装';}",
+                    );
+                }
             }
             Event::WindowEvent {
                 window_id,
@@ -307,6 +360,12 @@ fn open_desktop(
             }
             "toggle-tray" => {
                 let _ = proxy.send_event(UserEvent::ToggleTray);
+            }
+            "install-node" => {
+                let _ = proxy.send_event(UserEvent::InstallNode);
+            }
+            "install-dsh" => {
+                let _ = proxy.send_event(UserEvent::InstallDsh);
             }
             _ => {}
         })
@@ -449,6 +508,32 @@ fn icon_rgba() -> Result<(Vec<u8>, u32, u32), String> {
         .to_rgba8();
     let (width, height) = image.dimensions();
     Ok((image.into_raw(), width, height))
+}
+
+/// 运行自动安装命令（Windows 下隐藏控制台窗口），返回是否成功。
+pub fn run_install_command(bin: &str, args: &[&str]) -> bool {
+    #[cfg(windows)]
+    let mut command = {
+        use std::os::windows::process::CommandExt;
+        // npm 是 .cmd shim，CreateProcess 无法直接启动，需经 cmd /c
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg(bin).args(args);
+        c.creation_flags(0x0800_0000);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut c = std::process::Command::new(bin);
+        c.args(args);
+        c
+    };
+
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn show_main(desktop: Option<&DesktopState>) {

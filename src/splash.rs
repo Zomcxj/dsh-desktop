@@ -10,7 +10,7 @@ pub fn build_splash_html() -> String {
   body { margin: 0; min-height: 100vh; background: #000; color: #fff; font-family: "Segoe UI", system-ui, sans-serif; }
 
   /* 启动页面 */
-  #splash { display: grid; place-items: center; min-height: 100vh; }
+  #splash { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; gap: 12px; }
   #splash main { width: 360px; text-align: center; }
   h1 { margin: 0 0 5px; font-size: 21px; font-weight: 600; }
   .sub { margin-bottom: 22px; color: #8b8b8b; font-size: 12px; }
@@ -20,7 +20,28 @@ pub fn build_splash_html() -> String {
   .actions { display: flex; justify-content: center; gap: 8px; margin-top: 14px; }
   button { padding: 6px 18px; border: 1px solid #363636; border-radius: 5px; background: #191919; color: #fff; cursor: pointer; font: 12px "Segoe UI", system-ui, sans-serif; }
   button:hover { background: #292929; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes rowIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes checkingPulse { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
+
+  /* 环境检查面板 */
+  #env-panel { display: none; width: 420px; max-width: 92vw; margin: 0 auto; text-align: left; background: #121212; border: 1px solid #2a2a2a; border-radius: 8px; padding: 14px 16px; }
+  #env-panel h2 { margin: 0 0 12px; font-size: 14px; color: #ddd; }
+  .env-row { padding: 8px 10px; border-radius: 6px; margin-bottom: 8px; background: #1a1a1a; animation: rowIn .3s ease both; }
+  .env-row.bad { border: 1px solid #7a3030; }
+  .env-row.ok { border: 1px solid #2a4a2a; }
+  .env-row.checking { border: 1px dashed #4d6bfe; animation: none; }
+  .env-row.checking .env-name { animation: checkingPulse 1.2s ease-in-out infinite; color: #4d6bfe; }
+  .env-name { font-weight: 600; color: #eee; font-size: 13px; }
+  .env-status { float: right; font-size: 12px; }
+  .env-row.ok .env-status { color: #4caf50; }
+  .env-row.bad .env-status { color: #e57373; }
+  .env-row.checking .env-status { color: #4d6bfe; }
+  .env-hint { margin-top: 6px; color: #999; font-size: 11px; line-height: 1.5; word-break: break-all; }
+  .env-btn { margin-top: 8px; padding: 3px 12px; border: 1px solid #4d6bfe; border-radius: 4px; background: #2a3560; color: #fff; cursor: pointer; font: 11px "Segoe UI", system-ui, sans-serif; }
+  .env-btn:hover { background: #3a4a80; }
+  .env-btn:disabled { opacity: .5; cursor: wait; }
 </style>
 </head>
 <body>
@@ -28,19 +49,95 @@ pub fn build_splash_html() -> String {
 <main>
   <h1>DeepSeek Harness Desktop</h1>
   <div class="sub">DeepSeek Harness</div>
+
   <div id="spinner"></div>
   <div id="status">正在初始化...</div>
-  <div class="actions">
-    <button id="retry" class="hidden" onclick="window.ipc.postMessage('retry')">重试</button>
-    <button id="exit" class="hidden" onclick="window.ipc.postMessage('exit')">退出</button>
-  </div>
 </main>
+
+<!-- 环境检查面板：独立于 360px 的 main，居中显示 -->
+<div id="env-panel">
+  <h2>运行环境检查</h2>
+  <div id="env-list"></div>
+</div>
+<div class="actions" id="env-actions">
+  <button id="retry" class="hidden" onclick="window.ipc.postMessage('retry')">重试</button>
+  <button id="exit" class="hidden" onclick="window.ipc.postMessage('exit')">退出</button>
+</div>
 </div>
 <script>
   function setStatus(text) { document.getElementById('status').textContent = text; }
   function showFail(message) { setStatus(message); document.getElementById('spinner').classList.add('hidden'); document.getElementById('retry').classList.remove('hidden'); document.getElementById('exit').classList.remove('hidden'); }
   function showDone() { document.getElementById('spinner').classList.add('hidden'); }
-  function reset() { setStatus('正在初始化...'); document.getElementById('spinner').classList.remove('hidden'); document.getElementById('retry').classList.add('hidden'); document.getElementById('exit').classList.add('hidden'); }
+  function reset() { setStatus('正在初始化...'); document.getElementById('spinner').classList.remove('hidden'); document.getElementById('retry').classList.add('hidden'); document.getElementById('exit').classList.add('hidden'); document.getElementById('env-panel').style.display = 'none'; document.getElementById('env-list').innerHTML = ''; }
+
+  function showEnvProgress(name) {
+    var panel = document.getElementById('env-panel');
+    var list = document.getElementById('env-list');
+    panel.style.display = 'block';
+    // 清除前一行 checking 状态
+    Array.prototype.forEach.call(list.querySelectorAll('.checking'), function (r) {
+      r.parentNode.removeChild(r);
+    });
+    var row = document.createElement('div');
+    row.className = 'env-row checking';
+    var nameSpan = document.createElement('span');
+    nameSpan.className = 'env-name';
+    nameSpan.textContent = name;
+    var status = document.createElement('span');
+    status.className = 'env-status';
+    status.textContent = '正在检查...';
+    row.appendChild(nameSpan);
+    row.appendChild(status);
+    list.appendChild(row);
+  }
+
+  function showEnvCheck(results) {
+    var panel = document.getElementById('env-panel');
+    var list = document.getElementById('env-list');
+    list.innerHTML = '';
+    var allOk = true;
+    results.forEach(function (r, i) {
+      var row = document.createElement('div');
+      row.className = 'env-row ' + (r.ok ? 'ok' : 'bad');
+      row.style.animationDelay = (i * 120) + 'ms';
+      var name = document.createElement('span');
+      name.className = 'env-name';
+      name.textContent = r.name;
+      var status = document.createElement('span');
+      status.className = 'env-status';
+      status.textContent = r.ok ? ('✓ ' + (r.version || '已安装')) : '✗ ' + (r.error || '未安装');
+      row.appendChild(name);
+      row.appendChild(status);
+      if (!r.ok) {
+        allOk = false;
+        var hint = document.createElement('div');
+        hint.className = 'env-hint';
+        hint.textContent = '安装方式: ' + r.install_hint;
+        row.appendChild(hint);
+        var btn = document.createElement('button');
+        btn.className = 'env-btn';
+        btn.textContent = '自动安装';
+        btn.id = 'install-' + r.install_cmd;
+        btn.onclick = function () {
+          btn.disabled = true;
+          btn.textContent = '正在安装...';
+          window.ipc.postMessage(r.install_cmd);
+        };
+        row.appendChild(btn);
+      }
+      list.appendChild(row);
+    });
+    panel.style.display = 'block';
+    if (allOk) {
+      // 全部通过：面板保持显示，不再单独等待转圈，直接进入插件加载
+      document.getElementById('spinner').classList.add('hidden');
+      setStatus('环境检查通过，正在启动服务...');
+    } else {
+      document.getElementById('spinner').classList.add('hidden');
+      document.getElementById('retry').classList.remove('hidden');
+      document.getElementById('exit').classList.remove('hidden');
+    }
+  }
 </script>
 </body>
 </html>"#
@@ -86,11 +183,11 @@ pub fn inject_navbar_script() -> String {
       + '<span class="n-tip">设置</span>'
     + '</button>'
     + '<button class="n-btn" data-cmd="refresh">'
-      + '<svg viewBox="0 0 24 24"><path d="M2 12C2 6.48 6.48 2 12 2s10 4.48 10 10-4.48 10-10 10S2 17.52 2 12z"/><path d="M12 6v6l4 2"/></svg>'
+      + '<svg viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>'
       + '<span class="n-tip">刷新页面</span>'
     + '</button>'
     + '<button class="n-btn" data-cmd="restart">'
-      + '<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 1 9 9"/><path d="M3 3v6h6"/></svg>'
+      + '<svg viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>'
       + '<span class="n-tip">重启服务</span>'
     + '</button>'
     + '<button class="n-btn" id="dsh-btn-exit" data-cmd="toggle-exit-mode">'
@@ -173,9 +270,46 @@ pub fn nav_set_tray_mode(enabled: bool) -> String {
 pub fn ui_msg_js(message: &UiMsg) -> String {
     match message {
         UiMsg::Step(text) => format!("setStatus({text:?});"),
+        UiMsg::EnvProgress(name) => format!("showEnvProgress({name:?});"),
+        UiMsg::EnvCheck(results) => {
+            let items: Vec<String> = results
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{{ok:{ok},name:{name},version:{version},error:{error},install_hint:{hint},install_cmd:{cmd}}}",
+                        ok = if r.ok { "true" } else { "false" },
+                        name = js_str(r.name),
+                        version = js_str(r.version.as_deref().unwrap_or("")),
+                        error = js_str(&r.error),
+                        hint = js_str(r.install_hint),
+                        cmd = js_str(r.install_cmd),
+                    )
+                })
+                .collect();
+            format!("showEnvCheck([{}]);", items.join(","))
+        }
         UiMsg::Fail(error) => format!("showFail({error:?});"),
         UiMsg::Done(_) => "showDone();".into(),
     }
+}
+
+/// 生成 JS 字符串字面量（转义反斜杠、引号、换行、控制字符）
+fn js_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 pub fn apply_msg(webview: &wry::WebView, message: &UiMsg) -> bool {

@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use crate::checker;
 use crate::dsh_process::DshProcess;
+use crate::env_check::{self, EnvCheckResult};
+use crate::run_install_command;
 
 pub const DSH_URL: &str = "http://127.0.0.1:3080";
 pub const DSH_HOST: &str = "127.0.0.1";
@@ -11,8 +13,9 @@ pub const DSH_PORT: u16 = 3080;
 pub const READY_TIMEOUT: Duration = Duration::from_secs(60);
 pub const READY_POLL: Duration = Duration::from_millis(500);
 
-pub fn direct_launch_event_order() -> [&'static str; 3] {
+pub fn direct_launch_event_order() -> [&'static str; 4] {
     [
+        "正在检查运行环境...",
         "正在关闭 3080 端口上的服务...",
         "正在启动 dsh web 服务...",
         "等待服务就绪...",
@@ -33,6 +36,8 @@ fn close_dsh_port_listeners() -> Result<(), String> {
 
 pub enum UiMsg {
     Step(String),
+    EnvProgress(&'static str),
+    EnvCheck(Vec<EnvCheckResult>),
     Fail(String),
     Done(DshProcess),
 }
@@ -123,6 +128,40 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
         return;
     }
     send_step(&tx, direct_launch_event_order()[0]);
+    // 环境检查：Node.js / npm / dsh（逐项进行，带过程动画）
+    let mut results = Vec::with_capacity(3);
+    for check in [env_check::check_node, env_check::check_npm, env_check::check_dsh] {
+        if control.is_cancelled() {
+            return;
+        }
+        let name = match results.len() {
+            0 => "Node.js",
+            1 => "npm",
+            _ => "dsh (@deepseek-ai/dsh)",
+        };
+        let _ = tx.send(UiMsg::EnvProgress(name));
+        std::thread::sleep(Duration::from_millis(350));
+        results.push(check());
+    }
+    let _ = tx.send(UiMsg::EnvCheck(results.clone()));
+    if !env_check::all_ok(&results) {
+        // 环境不满足，停在检查面板等待安装后重试
+        return;
+    }
+    if control.is_cancelled() {
+        return;
+    }
+    // 检查 dsh 是否有新版本，有则自动更新
+    if let Err(error) = auto_update_dsh(&tx, &results, control) {
+        if !control.is_cancelled() {
+            let _ = tx.send(UiMsg::Fail(error));
+        }
+        return;
+    }
+    if control.is_cancelled() {
+        return;
+    }
+    send_step(&tx, direct_launch_event_order()[1]);
     if let Err(error) = close_dsh_port_listeners() {
         if !control.is_cancelled() {
             let _ = tx.send(UiMsg::Fail(error));
@@ -133,7 +172,7 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
     if control.is_cancelled() {
         return;
     }
-    send_step(&tx, direct_launch_event_order()[1]);
+    send_step(&tx, direct_launch_event_order()[2]);
     let permit = control.try_begin_spawn();
     let Some(_spawn_permit) = permit else {
         return;
@@ -152,7 +191,7 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
         return;
     }
 
-    send_step(&tx, direct_launch_event_order()[2]);
+    send_step(&tx, direct_launch_event_order()[3]);
     let mut elapsed = Duration::ZERO;
     while !checker::http_ready(DSH_HOST, DSH_PORT, READY_POLL) {
         if let Some(error) = process.exited_before_ready() {
@@ -186,6 +225,40 @@ fn send_step(tx: &Sender<UiMsg>, message: &str) {
     let _ = tx.send(UiMsg::Step(message.into()));
 }
 
+/// 对比本地与远程 dsh 版本，远程有新版本时自动安装并返回。
+fn auto_update_dsh(
+    tx: &Sender<UiMsg>,
+    results: &[EnvCheckResult],
+    control: &BootstrapControl,
+) -> Result<(), String> {
+    let local = results
+        .iter()
+        .find(|r| r.name.starts_with("dsh"))
+        .and_then(|r| r.version.clone());
+    let Some(local) = local else {
+        return Ok(());
+    };
+    if control.is_cancelled() {
+        return Ok(());
+    }
+    let Some(latest) = env_check::latest_dsh_version() else {
+        return Ok(()); // 网络不可用时不阻塞启动
+    };
+    if control.is_cancelled() {
+        return Ok(());
+    }
+    if latest.trim() == local.trim() {
+        return Ok(());
+    }
+    let _ = tx.send(UiMsg::Step(
+        format!("发现 dsh 新版本 {latest}，正在自动更新...").into(),
+    ));
+    if !run_install_command("npm", &["install", "-g", "@deepseek-ai/dsh"]) {
+        return Err(format!("dsh 自动更新到 {latest} 失败"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +276,7 @@ mod tests {
         for message in rx {
             match message {
                 UiMsg::Step(_) => steps += 1,
+                UiMsg::EnvProgress(_) | UiMsg::EnvCheck(_) => {}
                 UiMsg::Fail(_) | UiMsg::Done(_) => {
                     terminal = Some(message);
                     break;
@@ -228,10 +302,11 @@ mod tests {
     }
 
     #[test]
-    fn direct_bootstrap_orders_close_spawn_then_http_wait() {
+    fn direct_bootstrap_orders_env_check_close_spawn_then_http_wait() {
         assert_eq!(
             direct_launch_event_order(),
             [
+                "正在检查运行环境...",
                 "正在关闭 3080 端口上的服务...",
                 "正在启动 dsh web 服务...",
                 "等待服务就绪...",
