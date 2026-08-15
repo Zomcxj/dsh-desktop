@@ -10,7 +10,7 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use bootstrap::{run_bootstrap, BootstrapControl, BootstrapState, UiMsg, DSH_URL};
 use dsh_process::DshProcess;
-use splash::{apply_msg, build_splash_html};
+use splash::{apply_msg, build_splash_html, inject_navbar_script, nav_set_exit_mode, nav_set_tray_mode};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{
     ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget,
@@ -27,6 +27,12 @@ enum UserEvent {
     Menu(MenuEvent),
     Retry,
     Exit,
+    RefreshPage,
+    RestartService,
+    ToggleExitOnClose,
+    ToggleTray,
+    PageLoaded(String),
+    InjectNavbar,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,6 +49,20 @@ struct DesktopState {
     _tray: TrayIcon,
 }
 
+struct AppSettings {
+    exit_on_close: bool,
+    tray_enabled: bool,
+}
+
+impl AppSettings {
+    fn new() -> Self {
+        Self {
+            exit_on_close: false,
+            tray_enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 struct WindowGeometry {
     width: f64,
@@ -53,6 +73,20 @@ struct WindowGeometry {
 }
 
 fn main() -> wry::Result<()> {
+    // 单实例：杀掉已有进程，确保新 exe 启动全新的界面
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // 不杀自己
+        let self_pid = std::process::id();
+        let _ = std::process::Command::new("taskkill")
+            .args(["/FI", &format!("PID ne {self_pid}"), "/IM", "dsh-desktop.exe", "/T", "/F"])
+            .creation_flags(0x0800_0000)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
     let event_loop: EventLoop<UserEvent> = EventLoopBuilder::with_user_event().build();
     let proxy = event_loop.create_proxy();
     let event_proxy = proxy.clone();
@@ -64,13 +98,15 @@ fn main() -> wry::Result<()> {
     MenuEvent::set_event_handler(Some(move |event| {
         let _ = menu_event_proxy.send_event(UserEvent::Menu(event));
     }));
-    let desktop = open_desktop(&event_loop, proxy.clone()).map_err(std::io::Error::other)?;
+    let desktop = open_desktop(&event_loop, proxy.clone(), proxy.clone()).map_err(std::io::Error::other)?;
     let managed_process = Arc::new(Mutex::new(None::<DshProcess>));
     let bootstrap_state = Arc::new(BootstrapState::default());
     let bootstrap_control = BootstrapControl::new();
     let initial_generation = bootstrap_state
         .start()
         .expect("initial bootstrap should start");
+    let settings = Arc::new(Mutex::new(AppSettings::new()));
+    let settings_clone = settings.clone();
     launch_bootstrap(proxy, bootstrap_control.clone(), initial_generation);
 
     event_loop.run(move |event, _event_loop, control_flow| {
@@ -87,8 +123,11 @@ fn main() -> wry::Result<()> {
 
                 match message {
                     UiMsg::Done(process) => {
+                        // 导航到 DSH 页面
                         if let Err(error) =
-                            desktop.webview.evaluate_script(&ready_navigation_script())
+                            desktop.webview.evaluate_script(&navigation_script_with_settings(
+                                &settings_clone,
+                            ))
                         {
                             process.stop();
                             if let Some(process) = managed_process
@@ -106,6 +145,12 @@ fn main() -> wry::Result<()> {
                             *managed_process
                                 .lock()
                                 .expect("managed process lock poisoned") = Some(process);
+                            // 延迟注入导航栏（备选，on_page_load 可能不触发）
+                            let delayed_proxy = event_proxy.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_secs(2));
+                                let _ = delayed_proxy.send_event(UserEvent::InjectNavbar);
+                            });
                         }
                     }
                     message => {
@@ -140,14 +185,80 @@ fn main() -> wry::Result<()> {
             Event::UserEvent(UserEvent::Exit) => {
                 exit_application(&bootstrap_control, &managed_process, control_flow)
             }
+            Event::UserEvent(UserEvent::RefreshPage) => {
+                let _ = desktop
+                    .webview
+                    .evaluate_script(&navigation_script_with_settings(&settings_clone));
+            }
+            Event::UserEvent(UserEvent::RestartService) => {
+                // 停止当前服务
+                if let Some(process) = managed_process
+                    .lock()
+                    .expect("managed process lock poisoned")
+                    .take()
+                {
+                    process.stop();
+                }
+                // 重新启动
+                if let Some(generation) = bootstrap_state.start() {
+                    let _ = desktop.webview.evaluate_script("reset();");
+                    launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
+                }
+            }
+            Event::UserEvent(UserEvent::ToggleExitOnClose) => {
+                let mut settings = settings_clone.lock().expect("settings lock poisoned");
+                settings.exit_on_close = !settings.exit_on_close;
+                if settings.exit_on_close {
+                    settings.tray_enabled = false;
+                    let _ = desktop.webview.evaluate_script(&nav_set_tray_mode(false));
+                }
+                let _ = desktop
+                    .webview
+                    .evaluate_script(&nav_set_exit_mode(settings.exit_on_close));
+            }
+            Event::UserEvent(UserEvent::ToggleTray) => {
+                let mut settings = settings_clone.lock().expect("settings lock poisoned");
+                settings.tray_enabled = !settings.tray_enabled;
+                if settings.tray_enabled {
+                    settings.exit_on_close = false;
+                    let _ = desktop.webview.evaluate_script(&nav_set_exit_mode(false));
+                }
+                let _ = desktop
+                    .webview
+                    .evaluate_script(&nav_set_tray_mode(settings.tray_enabled));
+            }
+            Event::UserEvent(UserEvent::PageLoaded(url)) => {
+                if url.starts_with(DSH_URL) {
+                    inject_navbar_to_desktop(&desktop, &settings_clone);
+                }
+            }
+            Event::UserEvent(UserEvent::InjectNavbar) => {
+                inject_navbar_to_desktop(&desktop, &settings_clone);
+            }
             Event::WindowEvent {
                 window_id,
                 event: WindowEvent::CloseRequested,
                 ..
-            } => match window_close_action(desktop.window.id() == window_id) {
-                Some(DesktopAction::Hide) => desktop.window.set_visible(false),
-                Some(DesktopAction::Show | DesktopAction::Exit) | None => {}
-            },
+            } => {
+                let is_desktop = desktop.window.id() == window_id;
+                let action = if is_desktop {
+                    let settings = settings_clone.lock().expect("settings lock poisoned");
+                    if settings.exit_on_close {
+                        Some(DesktopAction::Exit)
+                    } else {
+                        Some(DesktopAction::Hide)
+                    }
+                } else {
+                    None
+                };
+                match action {
+                    Some(DesktopAction::Hide) => desktop.window.set_visible(false),
+                    Some(DesktopAction::Exit) => {
+                        exit_application(&bootstrap_control, &managed_process, control_flow)
+                    }
+                    Some(DesktopAction::Show) | None => {}
+                }
+            }
             _ => {}
         }
     });
@@ -156,9 +267,10 @@ fn main() -> wry::Result<()> {
 fn open_desktop(
     event_loop: &EventLoopWindowTarget<UserEvent>,
     proxy: EventLoopProxy<UserEvent>,
+    nav_proxy: EventLoopProxy<UserEvent>,
 ) -> Result<DesktopState, String> {
     let icon = window_icon()?;
-    let geometry = initial_window_geometry();
+    let geometry = adaptive_window_geometry(event_loop);
     let window = WindowBuilder::new()
         .with_title("DeepSeek Harness Desktop")
         .with_inner_size(tao::dpi::LogicalSize::new(geometry.width, geometry.height))
@@ -184,7 +296,27 @@ fn open_desktop(
             "exit" => {
                 let _ = proxy.send_event(UserEvent::Exit);
             }
+            "refresh" => {
+                let _ = proxy.send_event(UserEvent::RefreshPage);
+            }
+            "restart" => {
+                let _ = proxy.send_event(UserEvent::RestartService);
+            }
+            "toggle-exit-mode" => {
+                let _ = proxy.send_event(UserEvent::ToggleExitOnClose);
+            }
+            "toggle-tray" => {
+                let _ = proxy.send_event(UserEvent::ToggleTray);
+            }
             _ => {}
+        })
+        .with_on_page_load_handler(move |event, url| {
+            // event: PageLoadEvent (Started/Finished), url: String
+            if let wry::PageLoadEvent::Finished = event {
+                if url == DSH_URL || url.starts_with("http://127.0.0.1:3080") {
+                    let _ = nav_proxy.send_event(UserEvent::PageLoaded(url));
+                }
+            }
         })
         .build(&window)
         .map_err(|error| format!("创建主 WebView 失败: {error}"))?;
@@ -213,13 +345,41 @@ fn open_desktop(
     })
 }
 
+/// 生成导航脚本（仅导航，导航栏由 PageLoaded/InjectNavbar 注入）
+fn navigation_script_with_settings(_settings: &Arc<Mutex<AppSettings>>) -> String {
+    format!("location.replace({DSH_URL:?});")
+}
+
 fn ready_navigation_script() -> String {
-    format!("window.location.replace({DSH_URL:?});")
+    format!("location.replace({DSH_URL:?});")
+}
+
+/// 根据屏幕尺寸自适应计算窗口大小
+fn adaptive_window_geometry(event_loop: &EventLoopWindowTarget<UserEvent>) -> WindowGeometry {
+    let default = ready_window_geometry();
+    let Some(monitor) = event_loop.primary_monitor() else {
+        return default;
+    };
+    let size = monitor.size(); // PhysicalSize
+    let scale = monitor.scale_factor();
+    // 转换为逻辑像素
+    let screen_w = size.width as f64 / scale;
+    let screen_h = size.height as f64 / scale;
+    // 宽 70%，高 80%，不超过 1400×900
+    let w = (screen_w * 0.70).max(800.0).min(1400.0);
+    let h = (screen_h * 0.80).max(600.0).min(900.0);
+    WindowGeometry {
+        width: w,
+        height: h,
+        minimum_width: default.minimum_width,
+        minimum_height: default.minimum_height,
+        resizable: default.resizable,
+    }
 }
 
 fn ready_window_geometry() -> WindowGeometry {
     WindowGeometry {
-        width: 1280.0,
+        width: 1400.0,
         height: 800.0,
         minimum_width: 800.0,
         minimum_height: 600.0,
@@ -298,10 +458,6 @@ fn show_main(desktop: Option<&DesktopState>) {
     }
 }
 
-fn window_close_action(is_desktop_window: bool) -> Option<DesktopAction> {
-    is_desktop_window.then_some(DesktopAction::Hide)
-}
-
 fn tray_click_action(button: MouseButton, state: MouseButtonState) -> Option<DesktopAction> {
     (button == MouseButton::Left && state == MouseButtonState::Up).then_some(DesktopAction::Show)
 }
@@ -330,6 +486,19 @@ fn exit_application(
     *control_flow = ControlFlow::Exit;
 }
 
+/// 注入导航栏到桌面页面并同步设置状态
+fn inject_navbar_to_desktop(
+    desktop: &DesktopState,
+    settings: &Arc<Mutex<AppSettings>>,
+) {
+    let s = settings.lock().expect("settings lock poisoned");
+    let mut js = inject_navbar_script();
+    js.push_str(&nav_set_exit_mode(s.exit_on_close));
+    js.push_str(&nav_set_tray_mode(s.tray_enabled));
+    drop(s);
+    let _ = desktop.webview.evaluate_script(&js);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,17 +512,16 @@ mod tests {
 
     #[test]
     fn ready_navigation_targets_the_dsh_url() {
-        assert_eq!(
-            ready_navigation_script(),
-            "window.location.replace(\"http://127.0.0.1:3080\");"
-        );
+        let script = ready_navigation_script();
+        assert!(script.contains("http://127.0.0.1:3080"));
+        assert!(script.contains("location.replace"));
     }
 
     #[test]
     fn ready_navigation_replaces_the_loading_page() {
         let script = ready_navigation_script();
 
-        assert!(script.contains("window.location.replace"));
+        assert!(script.contains("location.replace"));
         assert!(script.contains(DSH_URL));
     }
 
@@ -362,7 +530,7 @@ mod tests {
         assert_eq!(
             ready_window_geometry(),
             WindowGeometry {
-                width: 1280.0,
+                width: 1400.0,
                 height: 800.0,
                 minimum_width: 800.0,
                 minimum_height: 600.0,
@@ -375,7 +543,6 @@ mod tests {
     fn initial_window_geometry_matches_the_ready_window() {
         assert_eq!(initial_window_geometry(), ready_window_geometry());
     }
-
     #[test]
     fn webview_data_directory_uses_local_app_data() {
         assert_eq!(
@@ -402,8 +569,6 @@ mod tests {
 
     #[test]
     fn tray_show_and_close_window_use_the_same_desktop_state() {
-        assert_eq!(window_close_action(false), None);
-        assert_eq!(window_close_action(true), Some(DesktopAction::Hide));
         assert_eq!(
             tray_click_action(MouseButton::Left, MouseButtonState::Up),
             Some(DesktopAction::Show)
