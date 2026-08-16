@@ -151,8 +151,8 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
     if control.is_cancelled() {
         return;
     }
-    // 检查 dsh 是否有新版本，有则自动更新
-    if let Err(error) = auto_update_dsh(&tx, &results, control) {
+    send_step(&tx, direct_launch_event_order()[1]);
+    if let Err(error) = close_dsh_port_listeners() {
         if !control.is_cancelled() {
             let _ = tx.send(UiMsg::Fail(error));
         }
@@ -161,8 +161,8 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
     if control.is_cancelled() {
         return;
     }
-    send_step(&tx, direct_launch_event_order()[1]);
-    if let Err(error) = close_dsh_port_listeners() {
+    // 关闭旧服务释放原生 DLL 后再更新 dsh。
+    if let Err(error) = auto_update_dsh(&tx, &results, control) {
         if !control.is_cancelled() {
             let _ = tx.send(UiMsg::Fail(error));
         }
@@ -256,7 +256,15 @@ fn auto_update_dsh(
     if !run_install_command("npm", &["install", "-g", "@deepseek-ai/dsh"]) {
         return Err(format!("dsh 自动更新到 {latest} 失败"));
     }
-    Ok(())
+    validate_dsh_update(&env_check::check_dsh(), &latest)
+}
+
+fn validate_dsh_update(result: &EnvCheckResult, expected: &str) -> Result<(), String> {
+    if result.ok && result.version.as_deref() == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!("dsh 更新后校验失败，期望版本 {expected}"))
+    }
 }
 
 #[cfg(test)]
@@ -360,5 +368,24 @@ mod tests {
         let second = state.start().unwrap();
         assert!(!state.is_current(first));
         assert!(state.is_current(second));
+    }
+
+    #[test]
+    fn dsh_update_requires_matching_healthy_version() {
+        let result = EnvCheckResult {
+            name: "dsh (@deepseek-ai/dsh)",
+            version: Some("0.1.3".into()),
+            ok: true,
+            error: String::new(),
+            install_hint: "",
+            install_cmd: "",
+        };
+        assert!(validate_dsh_update(&result, "0.1.3").is_ok());
+        assert!(validate_dsh_update(&result, "0.1.4").is_err());
+        assert!(validate_dsh_update(
+            &EnvCheckResult { ok: false, ..result },
+            "0.1.3"
+        )
+        .is_err());
     }
 }

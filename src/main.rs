@@ -4,6 +4,7 @@ mod bootstrap;
 mod checker;
 mod dsh_process;
 mod env_check;
+mod process;
 mod splash;
 
 use std::path::{Path, PathBuf};
@@ -409,10 +410,6 @@ fn navigation_script_with_settings(_settings: &Arc<Mutex<AppSettings>>) -> Strin
     format!("location.replace({DSH_URL:?});")
 }
 
-fn ready_navigation_script() -> String {
-    format!("location.replace({DSH_URL:?});")
-}
-
 /// 根据屏幕尺寸自适应计算窗口大小
 fn adaptive_window_geometry(event_loop: &EventLoopWindowTarget<UserEvent>) -> WindowGeometry {
     let default = ready_window_geometry();
@@ -444,10 +441,6 @@ fn ready_window_geometry() -> WindowGeometry {
         minimum_height: 600.0,
         resizable: true,
     }
-}
-
-fn initial_window_geometry() -> WindowGeometry {
-    ready_window_geometry()
 }
 
 fn webview_data_directory(local_app_data: &Path) -> PathBuf {
@@ -528,12 +521,12 @@ pub fn run_install_command(bin: &str, args: &[&str]) -> bool {
         c
     };
 
-    command
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let timeout = if bin == "winget" {
+        std::time::Duration::from_secs(15 * 60)
+    } else {
+        std::time::Duration::from_secs(5 * 60)
+    };
+    process::status(&mut command, timeout)
 }
 
 fn show_main(desktop: Option<&DesktopState>) {
@@ -596,21 +589,6 @@ mod tests {
     }
 
     #[test]
-    fn ready_navigation_targets_the_dsh_url() {
-        let script = ready_navigation_script();
-        assert!(script.contains("http://127.0.0.1:3080"));
-        assert!(script.contains("location.replace"));
-    }
-
-    #[test]
-    fn ready_navigation_replaces_the_loading_page() {
-        let script = ready_navigation_script();
-
-        assert!(script.contains("location.replace"));
-        assert!(script.contains(DSH_URL));
-    }
-
-    #[test]
     fn ready_window_geometry_restores_the_main_window() {
         assert_eq!(
             ready_window_geometry(),
@@ -624,10 +602,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn initial_window_geometry_matches_the_ready_window() {
-        assert_eq!(initial_window_geometry(), ready_window_geometry());
-    }
     #[test]
     fn webview_data_directory_uses_local_app_data() {
         assert_eq!(
@@ -685,5 +659,16 @@ mod tests {
     #[test]
     fn official_icon_creates_window_icon() {
         window_icon().expect("主窗口图标应可从内嵌 PNG 创建");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_command_times_out() {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "ping", "127.0.0.1", "-n", "3"]);
+        assert!(!crate::process::status(
+            &mut command,
+            std::time::Duration::from_millis(100)
+        ));
     }
 }

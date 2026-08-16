@@ -1,5 +1,6 @@
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
 /// 单项环境检查结果
 #[derive(Clone, Debug)]
@@ -35,11 +36,7 @@ fn run_output(bin: &str, args: &[&str]) -> Option<String> {
     #[cfg(not(windows))]
     let mut cmd = Command::new(bin).args(args).to_owned();
 
-    let output = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let output = crate::process::output(&mut cmd, Duration::from_secs(15))?;
     if !output.status.success() {
         return None;
     }
@@ -197,5 +194,17 @@ mod tests {
             let _ = root;
             Path::new("C:\\global\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js")
         });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_output_times_out() {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "ping", "127.0.0.1", "-n", "3"]);
+        let started = std::time::Instant::now();
+        assert!(
+            crate::process::output(&mut command, std::time::Duration::from_millis(100)).is_none()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }
