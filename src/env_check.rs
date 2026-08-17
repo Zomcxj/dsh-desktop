@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -83,7 +83,68 @@ pub fn check_npm() -> EnvCheckResult {
             install_hint: NPM_HINT,
             install_cmd: "install-node",
         },
-        None => miss("npm", NPM_HINT, "install-node"),
+        None => {
+            // Fallback: 从 node 安装目录找 npm.cmd
+            let Some(node_dir) = node_install_dir() else {
+                return miss("npm", NPM_HINT, "install-node");
+            };
+            let npm_path = node_dir.join("npm.cmd");
+            if npm_path.exists() {
+                match run_output_with_path(&npm_path, &["--version"]) {
+                    Some(version) => EnvCheckResult {
+                        name: "npm",
+                        version: Some(version),
+                        ok: true,
+                        error: String::new(),
+                        install_hint: NPM_HINT,
+                        install_cmd: "install-node",
+                    },
+                    None => miss("npm", NPM_HINT, "install-node"),
+                }
+            } else {
+                miss("npm", NPM_HINT, "install-node")
+            }
+        }
+    }
+}
+
+fn node_install_dir() -> Option<PathBuf> {
+    match run_output("node", &["-e", "console.log(process.execPath)"]) {
+        Some(path) => Some(Path::new(&path).parent()?.to_path_buf()),
+        None => {
+            let candidates = ["C:\\Program Files\\nodejs"];
+            for dir in &candidates {
+                let p = std::path::Path::new(dir);
+                if p.join("node.exe").exists() {
+                    return Some(p.to_path_buf());
+                }
+            }
+            None
+        }
+    }
+}
+
+fn run_output_with_path(bin: &Path, args: &[&str]) -> Option<String> {
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new(bin);
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(CREATE_NO_WINDOW);
+        c.args(args);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = Command::new(bin).args(args).to_owned();
+
+    let output = crate::process::output(&mut cmd, Duration::from_secs(15))?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 

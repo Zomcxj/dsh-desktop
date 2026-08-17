@@ -38,6 +38,7 @@ enum UserEvent {
     InstallNode,
     InstallDsh,
     InstallFinished(&'static str, bool),
+    UpdateAvailable(bool),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -155,6 +156,24 @@ fn main() -> wry::Result<()> {
                             std::thread::spawn(move || {
                                 std::thread::sleep(std::time::Duration::from_secs(2));
                                 let _ = delayed_proxy.send_event(UserEvent::InjectNavbar);
+                            });
+                            // 后台异步检查 dsh 更新
+                            let update_proxy = event_proxy.clone();
+                            std::thread::spawn(move || {
+                                if let Some(_latest) = crate::env_check::latest_dsh_version() {
+                                    let local = crate::env_check::check_dsh();
+                                    let needs_update = local.ok
+                                        && local.version.as_deref().map(|v| v.trim())
+                                            != Some(_latest.trim());
+                                    if needs_update {
+                                        let ok = crate::run_install_command(
+                                            "npm",
+                                            &["install", "-g", "@deepseek-ai/dsh"],
+                                        );
+                                        let _ = update_proxy
+                                            .send_event(UserEvent::UpdateAvailable(ok));
+                                    }
+                                }
                             });
                         }
                     }
@@ -274,6 +293,13 @@ fn main() -> wry::Result<()> {
                     let _ = install_proxy.send_event(UserEvent::InstallFinished("dsh", ok));
                 });
             }
+            Event::UserEvent(UserEvent::UpdateAvailable(true)) => {
+                let _ = desktop.webview.evaluate_script(
+                    r#"showUpdateDot();"#,
+                );
+            }
+            Event::UserEvent(UserEvent::UpdateAvailable(false)) => {}
+            
             Event::UserEvent(UserEvent::InstallFinished(which, success)) => {
                 if success {
                     // 自动重新检查环境并继续启动

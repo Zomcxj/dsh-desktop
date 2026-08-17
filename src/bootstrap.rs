@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use crate::checker;
 use crate::dsh_process::DshProcess;
-use crate::env_check::{self, EnvCheckResult};
-use crate::run_install_command;
+use crate::env_check;
+use crate::env_check::EnvCheckResult;
 
 pub const DSH_URL: &str = "http://127.0.0.1:3080";
 pub const DSH_HOST: &str = "127.0.0.1";
@@ -158,16 +158,6 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
         }
         return;
     }
-    if control.is_cancelled() {
-        return;
-    }
-    // 关闭旧服务释放原生 DLL 后再更新 dsh。
-    if let Err(error) = auto_update_dsh(&tx, &results, control) {
-        if !control.is_cancelled() {
-            let _ = tx.send(UiMsg::Fail(error));
-        }
-        return;
-    }
 
     if control.is_cancelled() {
         return;
@@ -223,48 +213,6 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
 
 fn send_step(tx: &Sender<UiMsg>, message: &str) {
     let _ = tx.send(UiMsg::Step(message.into()));
-}
-
-/// 对比本地与远程 dsh 版本，远程有新版本时自动安装并返回。
-fn auto_update_dsh(
-    tx: &Sender<UiMsg>,
-    results: &[EnvCheckResult],
-    control: &BootstrapControl,
-) -> Result<(), String> {
-    let local = results
-        .iter()
-        .find(|r| r.name.starts_with("dsh"))
-        .and_then(|r| r.version.clone());
-    let Some(local) = local else {
-        return Ok(());
-    };
-    if control.is_cancelled() {
-        return Ok(());
-    }
-    let Some(latest) = env_check::latest_dsh_version() else {
-        return Ok(()); // 网络不可用时不阻塞启动
-    };
-    if control.is_cancelled() {
-        return Ok(());
-    }
-    if latest.trim() == local.trim() {
-        return Ok(());
-    }
-    let _ = tx.send(UiMsg::Step(
-        format!("发现 dsh 新版本 {latest}，正在自动更新...").into(),
-    ));
-    if !run_install_command("npm", &["install", "-g", "@deepseek-ai/dsh"]) {
-        return Err(format!("dsh 自动更新到 {latest} 失败"));
-    }
-    validate_dsh_update(&env_check::check_dsh(), &latest)
-}
-
-fn validate_dsh_update(result: &EnvCheckResult, expected: &str) -> Result<(), String> {
-    if result.ok && result.version.as_deref() == Some(expected) {
-        Ok(())
-    } else {
-        Err(format!("dsh 更新后校验失败，期望版本 {expected}"))
-    }
 }
 
 #[cfg(test)]
@@ -368,24 +316,5 @@ mod tests {
         let second = state.start().unwrap();
         assert!(!state.is_current(first));
         assert!(state.is_current(second));
-    }
-
-    #[test]
-    fn dsh_update_requires_matching_healthy_version() {
-        let result = EnvCheckResult {
-            name: "dsh (@deepseek-ai/dsh)",
-            version: Some("0.1.3".into()),
-            ok: true,
-            error: String::new(),
-            install_hint: "",
-            install_cmd: "",
-        };
-        assert!(validate_dsh_update(&result, "0.1.3").is_ok());
-        assert!(validate_dsh_update(&result, "0.1.4").is_err());
-        assert!(validate_dsh_update(
-            &EnvCheckResult { ok: false, ..result },
-            "0.1.3"
-        )
-        .is_err());
     }
 }
