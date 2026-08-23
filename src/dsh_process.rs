@@ -93,7 +93,8 @@ impl DshProcess {
 fn dsh_web_command(appdata: &Path) -> Command {
     let bin = resolve_dsh_bin(appdata);
     let mut command = Command::new("node");
-    command.arg(bin).arg("web");
+    // --no-open: dsh 0.1.1+ 默认会打开系统浏览器，桌面壳自带 WebView，无需重复打开
+    command.arg(bin).args(["web", "--no-open"]);
     command
 }
 
@@ -205,13 +206,14 @@ mod tests {
 
         assert_eq!(command.get_program(), "node");
         let args: Vec<_> = command.get_args().collect();
-        assert_eq!(args.len(), 2, "应有两个参数: bin.js 路径和 'web'");
+        assert_eq!(args.len(), 3, "应有三个参数: bin.js 路径、'web' 和 '--no-open'");
         assert!(
             args[0].to_string_lossy().ends_with("bin.js"),
             "第一个参数应以 bin.js 结尾: {}",
             args[0].to_string_lossy()
         );
         assert_eq!(args[1], "web");
+        assert_eq!(args[2], "--no-open", "必须禁用 dsh 自动打开系统浏览器");
         assert_ne!(command.get_program(), "cmd");
     }
 
