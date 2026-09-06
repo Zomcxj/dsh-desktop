@@ -39,6 +39,7 @@ enum UserEvent {
     InstallDsh,
     InstallFinished(&'static str, bool),
     UpdateAvailable(bool),
+    AuthCookie(Option<String>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -113,6 +114,8 @@ fn main() -> wry::Result<()> {
         .expect("initial bootstrap should start");
     let settings = Arc::new(Mutex::new(AppSettings::new()));
     let settings_clone = settings.clone();
+    // 新版 dsh 的启动授权状态：Rust 取 cookie，中间页就绪后注入再跳首页
+    let auth_boot = Arc::new(Mutex::new(AuthBootState::new()));
     launch_bootstrap(proxy, bootstrap_control.clone(), initial_generation);
 
     event_loop.run(move |event, _event_loop, control_flow| {
@@ -129,11 +132,31 @@ fn main() -> wry::Result<()> {
 
                 match message {
                     UiMsg::Done(process) => {
+                        // 新版 dsh 需要浏览器授权：Rust 直接请求授权 URL 取得 cookie，
+                        // 内嵌 WebView 先落到同源的 favicon.svg，经 document.cookie
+                        // 写入后再跳首页，全程不渲染 401。
+                        let target = process
+                            .authenticated_url()
+                            .unwrap_or_else(|| DSH_URL.to_string());
+                        let needs_auth = target.contains("token=");
+                        let boot_url = if needs_auth {
+                            let mut state = auth_boot.lock().unwrap();
+                            *state = AuthBootState::new();
+                            drop(state);
+                            // 后台取 cookie（成功 AuthCookie(Some) / 失败 AuthCookie(None)）
+                            let fetch_proxy = event_proxy.clone();
+                            let fetch_target = target.clone();
+                            std::thread::spawn(move || {
+                                let cookie = fetch_auth_cookie(&fetch_target);
+                                let _ = fetch_proxy.send_event(UserEvent::AuthCookie(cookie));
+                            });
+                            format!("{DSH_URL}{AUTH_BOOT_PATH}")
+                        } else {
+                            target.clone()
+                        };
                         // 导航到 DSH 页面
                         if let Err(error) =
-                            desktop.webview.evaluate_script(&navigation_script_with_settings(
-                                &settings_clone,
-                            ))
+                            desktop.webview.evaluate_script(&navigation_script(&boot_url))
                         {
                             process.stop();
                             if let Some(process) = managed_process
@@ -212,7 +235,7 @@ fn main() -> wry::Result<()> {
             Event::UserEvent(UserEvent::RefreshPage) => {
                 let _ = desktop
                     .webview
-                    .evaluate_script(&navigation_script_with_settings(&settings_clone));
+                    .evaluate_script(&navigation_script(DSH_URL));
             }
             Event::UserEvent(UserEvent::RestartService) => {
                 // 停止当前服务
@@ -255,9 +278,21 @@ fn main() -> wry::Result<()> {
                     .evaluate_script(&nav_set_tray_mode(settings.tray_enabled));
             }
             Event::UserEvent(UserEvent::PageLoaded(url)) => {
-                if url.starts_with(DSH_URL) {
+                if url == format!("{DSH_URL}{AUTH_BOOT_PATH}") {
+                    auth_boot.lock().unwrap().ready = true;
+                    complete_auth_boot(&desktop, &auth_boot);
+                } else if url.starts_with(DSH_URL) {
                     inject_navbar_to_desktop(&desktop, &settings_clone);
                 }
+            }
+            Event::UserEvent(UserEvent::AuthCookie(cookie)) => {
+                let mut state = auth_boot.lock().unwrap();
+                match cookie {
+                    Some(value) => state.cookie = Some(value),
+                    None => state.failed = true,
+                }
+                drop(state);
+                complete_auth_boot(&desktop, &auth_boot);
             }
             Event::UserEvent(UserEvent::InjectNavbar) => {
                 inject_navbar_to_desktop(&desktop, &settings_clone);
@@ -432,8 +467,104 @@ fn open_desktop(
 }
 
 /// 生成导航脚本（仅导航，导航栏由 PageLoaded/InjectNavbar 注入）
-fn navigation_script_with_settings(_settings: &Arc<Mutex<AppSettings>>) -> String {
-    format!("location.replace({DSH_URL:?});")
+fn navigation_script(target: &str) -> String {
+    format!("location.replace({target:?});")
+}
+
+/// 授权中间页：取 dsh 静态资源 favicon.svg（真实 200 的同源文档，不走授权栅栏、
+/// 不触发 WebView2 错误页），在其中执行 document.cookie 写入后跳首页。
+const AUTH_BOOT_PATH: &str = "/favicon.svg";
+
+/// 启动授权的中间状态：cookie 由 Rust 直接请求授权 URL 获取，中间页就绪后
+/// 经 `document.cookie` 同步写入，再跳首页，规避 WebView2 的 cookie 落盘竞态。
+struct AuthBootState {
+    cookie: Option<String>,
+    failed: bool,
+    ready: bool,
+}
+
+impl AuthBootState {
+    fn new() -> Self {
+        Self {
+            cookie: None,
+            failed: false,
+            ready: false,
+        }
+    }
+}
+
+fn complete_auth_boot(desktop: &DesktopState, auth: &Mutex<AuthBootState>) {
+    let mut state = auth.lock().unwrap();
+    if !state.ready {
+        return;
+    }
+    if state.cookie.is_none() && !state.failed {
+        return;
+    }
+    state.ready = false;
+    let script = if state.failed {
+        navigation_script(DSH_URL)
+    } else if let Some(value) = state.cookie.take() {
+        format!(
+            "document.cookie = {:?}; location.replace({:?});",
+            value, DSH_URL
+        )
+    } else {
+        return;
+    };
+    drop(state);
+    let _ = desktop.webview.evaluate_script(&script);
+}
+
+/// 请求 dsh 打印的授权 URL，取回服务端 `Set-Cookie` 的值（name=value + 属性）。
+fn fetch_auth_cookie(url: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let rest = url.strip_prefix("http://")?;
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (rest, "/".into()),
+    };
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok()?),
+        None => (authority, 80),
+    };
+    let mut stream = TcpStream::connect((host, port)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .ok()?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+        let count = stream.read(&mut chunk).ok()?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        if bytes.len() > 64 * 1024 {
+            return None;
+        }
+    }
+    let headers = String::from_utf8_lossy(&bytes);
+    parse_set_cookie_value(&headers)
+}
+
+/// 从 HTTP 响应头文本中提取第一个 `set-cookie:` 头值。
+fn parse_set_cookie_value(headers: &str) -> Option<String> {
+    headers
+        .lines()
+        .map(|line| line.trim())
+        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+        .and_then(|line| line.split_once(':').map(|(_, value)| value.trim().to_string()))
+        .filter(|value| !value.is_empty())
 }
 
 /// 根据屏幕尺寸自适应计算窗口大小
@@ -685,6 +816,22 @@ mod tests {
     #[test]
     fn official_icon_creates_window_icon() {
         window_icon().expect("主窗口图标应可从内嵌 PNG 创建");
+    }
+
+    #[test]
+    fn parse_set_cookie_value_extracts_first_cookie() {
+        let headers = "\
+HTTP/1.1 303 See Other\r
+cache-control: no-store\r
+location: /\r
+set-cookie: dsh-auth-x=v1.abc.def; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict\r
+\r
+";
+        assert_eq!(
+            parse_set_cookie_value(headers).as_deref(),
+            Some("dsh-auth-x=v1.abc.def; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict")
+        );
+        assert!(parse_set_cookie_value("HTTP/1.1 404 Not Found\r\n\r\n").is_none());
     }
 
     #[cfg(windows)]

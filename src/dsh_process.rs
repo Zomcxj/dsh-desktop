@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -12,6 +12,8 @@ pub struct DshProcess {
     child: Arc<Mutex<Option<Child>>>,
     stderr_reader: Arc<Mutex<Option<JoinHandle<String>>>>,
     stdout_reader: Arc<Mutex<Option<JoinHandle<String>>>>,
+    /// dsh web 启动时打印的带授权 token 的 URL，用于让内嵌 WebView 完成浏览器授权
+    authenticated_url: Arc<Mutex<Option<String>>>,
 }
 
 #[cfg(windows)]
@@ -31,17 +33,29 @@ impl DshProcess {
 
         let mut child = command.spawn()?;
         let pid = child.id();
-        let stdout_reader =
-            drain_output(child.stdout.take().expect("stdout was configured as piped"));
+        let authenticated_url = Arc::new(Mutex::new(None::<String>));
+        let stdout_reader = drain_output(
+            child.stdout.take().expect("stdout was configured as piped"),
+            Some(authenticated_url.clone()),
+        );
         let stderr_reader =
-            drain_output(child.stderr.take().expect("stderr was configured as piped"));
+            drain_output(child.stderr.take().expect("stderr was configured as piped"), None);
         Ok(Self {
             managed: true,
             pid: Some(pid),
             child: Arc::new(Mutex::new(Some(child))),
             stderr_reader: Arc::new(Mutex::new(Some(stderr_reader))),
             stdout_reader: Arc::new(Mutex::new(Some(stdout_reader))),
+            authenticated_url,
         })
+    }
+
+    /// dsh web 打印的授权 URL（形如 `http://127.0.0.1:3080/?token=...`），就绪后必有值。
+    pub fn authenticated_url(&self) -> Option<String> {
+        self.authenticated_url
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     pub fn exited_before_ready(&self) -> Option<String> {
@@ -185,12 +199,42 @@ fn child_exited_before_ready(stderr: &str) -> String {
     }
 }
 
-fn drain_output<R: Read + Send + 'static>(mut output: R) -> JoinHandle<String> {
+fn drain_output<R: Read + Send + 'static>(
+    output: R,
+    url_sink: Option<Arc<Mutex<Option<String>>>>,
+) -> JoinHandle<String> {
     thread::spawn(move || {
         let mut text = String::new();
-        let _ = output.read_to_string(&mut text);
+        let mut reader = BufReader::new(output);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let (Some(sink), Some(url)) =
+                        (url_sink.as_ref(), authenticated_url_from_line(&line))
+                    {
+                        if let Ok(mut guard) = sink.lock() {
+                            if guard.is_none() {
+                                *guard = Some(url);
+                            }
+                        }
+                    }
+                    text.push_str(&line);
+                }
+                Err(_) => break,
+            }
+        }
         text
     })
+}
+
+/// 从 dsh web 启动日志行提取授权 URL（`dsh web: http://127.0.0.1:3080/?token=...`）。
+fn authenticated_url_from_line(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .find(|token| token.starts_with("http://127.0.0.1:3080"))
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -269,13 +313,20 @@ mod tests {
         assert!(process.pid.is_some());
         let mut ready = false;
         for _ in 0..60 {
-            if checker::http_ready("127.0.0.1", 3080, Duration::from_millis(500)) {
+            if checker::http_ready("127.0.0.1", 3080, Duration::from_millis(500))
+                && process.authenticated_url().is_some()
+            {
                 ready = true;
                 break;
             }
             std::thread::sleep(Duration::from_secs(1));
         }
         assert!(ready, "dsh web 未在 60s 内就绪");
+        let url = process.authenticated_url().expect("应捕获到授权 URL");
+        assert!(
+            url.starts_with("http://127.0.0.1:3080"),
+            "授权 URL 应指向本机 3080: {url}"
+        );
         process.stop();
         std::thread::sleep(Duration::from_millis(1500));
         assert!(!checker::http_ready(
@@ -293,7 +344,22 @@ mod tests {
             child: Arc::new(Mutex::new(None)),
             stderr_reader: Arc::new(Mutex::new(None)),
             stdout_reader: Arc::new(Mutex::new(None)),
+            authenticated_url: Arc::new(Mutex::new(None)),
         };
         process.stop();
+    }
+
+    #[test]
+    fn authenticated_url_is_extracted_from_startup_line() {
+        let line = "dsh web: http://127.0.0.1:3080/?token=abc (LAN: http://192.168.1.2:3080/?token=abc)";
+        assert_eq!(
+            authenticated_url_from_line(line).as_deref(),
+            Some("http://127.0.0.1:3080/?token=abc")
+        );
+        assert_eq!(
+            authenticated_url_from_line("dsh web: http://127.0.0.1:3080").as_deref(),
+            Some("http://127.0.0.1:3080")
+        );
+        assert!(authenticated_url_from_line("some unrelated startup line").is_none());
     }
 }

@@ -183,7 +183,12 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
 
     send_step(&tx, direct_launch_event_order()[3]);
     let mut elapsed = Duration::ZERO;
-    while !checker::http_ready(DSH_HOST, DSH_PORT, READY_POLL) {
+    loop {
+        let http_ready = checker::http_ready(DSH_HOST, DSH_PORT, READY_POLL);
+        let url_ready = process.authenticated_url().is_some();
+        if http_ready && url_ready {
+            break;
+        }
         if let Some(error) = process.exited_before_ready() {
             let _ = tx.send(UiMsg::Fail(error));
             return;
