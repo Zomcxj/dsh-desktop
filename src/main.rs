@@ -39,7 +39,12 @@ enum UserEvent {
     InstallDsh,
     InstallFinished(&'static str, bool),
     UpdateAvailable(bool),
-    AuthCookie(Option<String>),
+    InstallDshUpdate,
+    DshUpdateFinished(Result<String, String>),
+    ShowUpdateFailure(String),
+    DismissDshUpdate,
+    AuthPageProbe(u64, String),
+    AuthRetry(u64),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -59,6 +64,19 @@ struct DesktopState {
 struct AppSettings {
     exit_on_close: bool,
     tray_enabled: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UpdateAction {
+    Restart,
+    FailInstall,
+    FailValidation,
+}
+
+struct AuthRetryState {
+    session: u64,
+    url: String,
+    attempts: u8,
 }
 
 impl AppSettings {
@@ -114,9 +132,10 @@ fn main() -> wry::Result<()> {
         .expect("initial bootstrap should start");
     let settings = Arc::new(Mutex::new(AppSettings::new()));
     let settings_clone = settings.clone();
-    // 新版 dsh 的启动授权状态：Rust 取 cookie，中间页就绪后注入再跳首页
-    let auth_boot = Arc::new(Mutex::new(AuthBootState::new()));
     launch_bootstrap(proxy, bootstrap_control.clone(), initial_generation);
+    let mut auth_retry = None::<AuthRetryState>;
+    let mut auth_session = 0_u64;
+    let mut dsh_update_in_progress = false;
 
     event_loop.run(move |event, _event_loop, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -131,32 +150,19 @@ fn main() -> wry::Result<()> {
                 }
 
                 match message {
-                    UiMsg::Done(process) => {
-                        // 新版 dsh 需要浏览器授权：Rust 直接请求授权 URL 取得 cookie，
-                        // 内嵌 WebView 先落到同源的 favicon.svg，经 document.cookie
-                        // 写入后再跳首页，全程不渲染 401。
+            UiMsg::Done(process) => {
                         let target = process
                             .authenticated_url()
                             .unwrap_or_else(|| DSH_URL.to_string());
-                        let needs_auth = target.contains("token=");
-                        let boot_url = if needs_auth {
-                            let mut state = auth_boot.lock().unwrap();
-                            *state = AuthBootState::new();
-                            drop(state);
-                            // 后台取 cookie（成功 AuthCookie(Some) / 失败 AuthCookie(None)）
-                            let fetch_proxy = event_proxy.clone();
-                            let fetch_target = target.clone();
-                            std::thread::spawn(move || {
-                                let cookie = fetch_auth_cookie(&fetch_target);
-                                let _ = fetch_proxy.send_event(UserEvent::AuthCookie(cookie));
-                            });
-                            format!("{DSH_URL}{AUTH_BOOT_PATH}")
-                        } else {
-                            target.clone()
-                        };
-                        // 导航到 DSH 页面
+                        auth_session += 1;
+                        auth_retry = target.contains("token=").then(|| AuthRetryState {
+                            session: auth_session,
+                            url: target.clone(),
+                            attempts: 0,
+                        });
+                        // 直接打开 token URL，让 WebView 接收 dsh 返回的 HttpOnly cookie。
                         if let Err(error) =
-                            desktop.webview.evaluate_script(&navigation_script(&boot_url))
+                            desktop.webview.evaluate_script(&navigation_script(&target))
                         {
                             process.stop();
                             if let Some(process) = managed_process
@@ -166,6 +172,7 @@ fn main() -> wry::Result<()> {
                             {
                                 process.stop();
                             }
+                            auth_retry = None;
                             let _ = apply_msg(
                                 &desktop.webview,
                                 &UiMsg::Fail(format!("加载主界面失败: {error}")),
@@ -180,7 +187,7 @@ fn main() -> wry::Result<()> {
                                 std::thread::sleep(std::time::Duration::from_secs(2));
                                 let _ = delayed_proxy.send_event(UserEvent::InjectNavbar);
                             });
-                            // 后台异步检查 dsh 更新
+                            // 后台只检查更新，不在 dsh 运行时修改全局 node_modules。
                             let update_proxy = event_proxy.clone();
                             std::thread::spawn(move || {
                                 if let Some(_latest) = crate::env_check::latest_dsh_version() {
@@ -189,12 +196,7 @@ fn main() -> wry::Result<()> {
                                         && local.version.as_deref().map(|v| v.trim())
                                             != Some(_latest.trim());
                                     if needs_update {
-                                        let ok = crate::run_install_command(
-                                            "npm",
-                                            &["install", "-g", "@deepseek-ai/dsh"],
-                                        );
-                                        let _ = update_proxy
-                                            .send_event(UserEvent::UpdateAvailable(ok));
+                                        let _ = update_proxy.send_event(UserEvent::UpdateAvailable(true));
                                     }
                                 }
                             });
@@ -225,6 +227,7 @@ fn main() -> wry::Result<()> {
             },
             Event::UserEvent(UserEvent::Retry) => {
                 if let Some(generation) = bootstrap_state.start() {
+                    auth_retry = None;
                     let _ = desktop.webview.evaluate_script("reset();");
                     launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
                 }
@@ -233,12 +236,21 @@ fn main() -> wry::Result<()> {
                 exit_application(&bootstrap_control, &managed_process, control_flow)
             }
             Event::UserEvent(UserEvent::RefreshPage) => {
+                auth_retry = None;
+                let target = managed_process
+                    .lock()
+                    .expect("managed process lock poisoned")
+                    .as_ref()
+                    .and_then(DshProcess::authenticated_url)
+                    .map(|url| page_navigation_target(Some(&url)).to_string())
+                    .unwrap_or_else(|| page_navigation_target(None).to_string());
                 let _ = desktop
                     .webview
-                    .evaluate_script(&navigation_script(DSH_URL));
+                    .evaluate_script(&navigation_script(&target));
             }
             Event::UserEvent(UserEvent::RestartService) => {
                 // 停止当前服务
+                auth_retry = None;
                 if let Some(process) = managed_process
                     .lock()
                     .expect("managed process lock poisoned")
@@ -278,21 +290,46 @@ fn main() -> wry::Result<()> {
                     .evaluate_script(&nav_set_tray_mode(settings.tray_enabled));
             }
             Event::UserEvent(UserEvent::PageLoaded(url)) => {
-                if url == format!("{DSH_URL}{AUTH_BOOT_PATH}") {
-                    auth_boot.lock().unwrap().ready = true;
-                    complete_auth_boot(&desktop, &auth_boot);
-                } else if url.starts_with(DSH_URL) {
+                if url.starts_with(DSH_URL) {
                     inject_navbar_to_desktop(&desktop, &settings_clone);
+                    if auth_retry.is_some() {
+                        let probe_proxy = event_proxy.clone();
+                        let session = auth_retry.as_ref().map(|state| state.session);
+                        if let Some(session) = session {
+                            let _ = desktop.webview.evaluate_script_with_callback(
+                                "(document.title || '') + '\\n' + (document.body ? document.body.innerText : '')",
+                                move |text| {
+                                    let _ = probe_proxy
+                                        .send_event(UserEvent::AuthPageProbe(session, text));
+                                },
+                            );
+                        }
+                    }
                 }
             }
-            Event::UserEvent(UserEvent::AuthCookie(cookie)) => {
-                let mut state = auth_boot.lock().unwrap();
-                match cookie {
-                    Some(value) => state.cookie = Some(value),
-                    None => state.failed = true,
+            Event::UserEvent(UserEvent::AuthPageProbe(session, text)) => {
+                if auth_retry_matches_session(auth_retry.as_ref(), session) {
+                    let should_retry = auth_retry.as_ref().is_some_and(|state| {
+                        should_retry_auth_page(&text, state.attempts)
+                    });
+                    if should_retry {
+                        if let Some(state) = auth_retry.as_mut() {
+                            state.attempts += 1;
+                        }
+                        let retry_proxy = event_proxy.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            let _ = retry_proxy.send_event(UserEvent::AuthRetry(session));
+                        });
+                    } else if !text.to_ascii_lowercase().contains("authentication required") {
+                        auth_retry = None;
+                    }
                 }
-                drop(state);
-                complete_auth_boot(&desktop, &auth_boot);
+            }
+            Event::UserEvent(UserEvent::AuthRetry(session)) => {
+                if let Some(state) = auth_retry.as_ref().filter(|state| state.session == session) {
+                    let _ = desktop.webview.evaluate_script(&navigation_script(&state.url));
+                }
             }
             Event::UserEvent(UserEvent::InjectNavbar) => {
                 inject_navbar_to_desktop(&desktop, &settings_clone);
@@ -328,13 +365,70 @@ fn main() -> wry::Result<()> {
                     let _ = install_proxy.send_event(UserEvent::InstallFinished("dsh", ok));
                 });
             }
+            Event::UserEvent(UserEvent::InstallDshUpdate) => {
+                if dsh_update_in_progress {
+                    return;
+                }
+                dsh_update_in_progress = true;
+                auth_retry = None;
+                if let Some(process) = managed_process
+                    .lock()
+                    .expect("managed process lock poisoned")
+                    .take()
+                {
+                    process.stop();
+                }
+                let update_proxy = event_proxy.clone();
+                std::thread::spawn(move || {
+                    let install_ok = run_install_command("npm", &["install", "-g", "@deepseek-ai/dsh"]);
+                    let validation = install_ok.then(crate::env_check::validate_dsh_installation);
+                    let result = match update_action(install_ok, validation.as_ref().is_some_and(Result::is_ok)) {
+                        UpdateAction::Restart => validation
+                            .expect("successful installation must have validation result")
+                            .map_err(|error| error),
+                        UpdateAction::FailInstall => Err("dsh 更新安装失败，请稍后重试".into()),
+                        UpdateAction::FailValidation => Err(validation
+                            .expect("failed validation must have validation result")
+                            .expect_err("failed validation must contain an error")),
+                    };
+                    let _ = update_proxy.send_event(UserEvent::DshUpdateFinished(result));
+                });
+                let _ = desktop.webview.load_html(&build_splash_html());
+            }
+            Event::UserEvent(UserEvent::DshUpdateFinished(result)) => {
+                dsh_update_in_progress = false;
+                match result {
+                    Ok(_) => {
+                        let _ = desktop.webview.load_html(&build_splash_html());
+                        if let Some(generation) = bootstrap_state.start() {
+                            launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = desktop.webview.load_html(&build_splash_html());
+                        let failure_proxy = event_proxy.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            let _ = failure_proxy.send_event(UserEvent::ShowUpdateFailure(error));
+                        });
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::ShowUpdateFailure(error)) => {
+                let _ = desktop
+                    .webview
+                    .evaluate_script(&format!("showUpdateFail({error:?});"));
+            }
+            Event::UserEvent(UserEvent::DismissDshUpdate) => {
+                let _ = desktop.webview.evaluate_script("dismissUpdateDot();");
+            }
             Event::UserEvent(UserEvent::UpdateAvailable(true)) => {
                 let _ = desktop.webview.evaluate_script(
                     r#"showUpdateDot();"#,
                 );
             }
             Event::UserEvent(UserEvent::UpdateAvailable(false)) => {}
-            
+
             Event::UserEvent(UserEvent::InstallFinished(which, success)) => {
                 if success {
                     // 自动重新检查环境并继续启动
@@ -429,6 +523,12 @@ fn open_desktop(
             "install-dsh" => {
                 let _ = proxy.send_event(UserEvent::InstallDsh);
             }
+            "update-dsh" => {
+                let _ = proxy.send_event(UserEvent::InstallDshUpdate);
+            }
+            "dismiss-dsh-update" => {
+                let _ = proxy.send_event(UserEvent::DismissDshUpdate);
+            }
             _ => {}
         })
         .with_on_page_load_handler(move |event, url| {
@@ -471,100 +571,29 @@ fn navigation_script(target: &str) -> String {
     format!("location.replace({target:?});")
 }
 
-/// 授权中间页：取 dsh 静态资源 favicon.svg（真实 200 的同源文档，不走授权栅栏、
-/// 不触发 WebView2 错误页），在其中执行 document.cookie 写入后跳首页。
-const AUTH_BOOT_PATH: &str = "/favicon.svg";
-
-/// 启动授权的中间状态：cookie 由 Rust 直接请求授权 URL 获取，中间页就绪后
-/// 经 `document.cookie` 同步写入，再跳首页，规避 WebView2 的 cookie 落盘竞态。
-struct AuthBootState {
-    cookie: Option<String>,
-    failed: bool,
-    ready: bool,
+fn page_navigation_target(authenticated_url: Option<&str>) -> &str {
+    authenticated_url.unwrap_or(DSH_URL)
 }
 
-impl AuthBootState {
-    fn new() -> Self {
-        Self {
-            cookie: None,
-            failed: false,
-            ready: false,
-        }
-    }
+fn should_retry_auth_page(text: &str, attempts: u8) -> bool {
+    attempts == 0
+        && text
+            .to_ascii_lowercase()
+            .contains("authentication required")
 }
 
-fn complete_auth_boot(desktop: &DesktopState, auth: &Mutex<AuthBootState>) {
-    let mut state = auth.lock().unwrap();
-    if !state.ready {
-        return;
-    }
-    if state.cookie.is_none() && !state.failed {
-        return;
-    }
-    state.ready = false;
-    let script = if state.failed {
-        navigation_script(DSH_URL)
-    } else if let Some(value) = state.cookie.take() {
-        format!(
-            "document.cookie = {:?}; location.replace({:?});",
-            value, DSH_URL
-        )
+fn auth_retry_matches_session(state: Option<&AuthRetryState>, session: u64) -> bool {
+    state.is_some_and(|state| state.session == session)
+}
+
+fn update_action(install_ok: bool, validation_ok: bool) -> UpdateAction {
+    if !install_ok {
+        UpdateAction::FailInstall
+    } else if !validation_ok {
+        UpdateAction::FailValidation
     } else {
-        return;
-    };
-    drop(state);
-    let _ = desktop.webview.evaluate_script(&script);
-}
-
-/// 请求 dsh 打印的授权 URL，取回服务端 `Set-Cookie` 的值（name=value + 属性）。
-fn fetch_auth_cookie(url: &str) -> Option<String> {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::time::Duration;
-
-    let rest = url.strip_prefix("http://")?;
-    let (authority, path) = match rest.split_once('/') {
-        Some((authority, path)) => (authority, format!("/{path}")),
-        None => (rest, "/".into()),
-    };
-    let (host, port) = match authority.split_once(':') {
-        Some((host, port)) => (host, port.parse::<u16>().ok()?),
-        None => (authority, 80),
-    };
-    let mut stream = TcpStream::connect((host, port)).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok()?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .ok()?;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).ok()?;
-
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 4096];
-    while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-        let count = stream.read(&mut chunk).ok()?;
-        if count == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&chunk[..count]);
-        if bytes.len() > 64 * 1024 {
-            return None;
-        }
+        UpdateAction::Restart
     }
-    let headers = String::from_utf8_lossy(&bytes);
-    parse_set_cookie_value(&headers)
-}
-
-/// 从 HTTP 响应头文本中提取第一个 `set-cookie:` 头值。
-fn parse_set_cookie_value(headers: &str) -> Option<String> {
-    headers
-        .lines()
-        .map(|line| line.trim())
-        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
-        .and_then(|line| line.split_once(':').map(|(_, value)| value.trim().to_string()))
-        .filter(|value| !value.is_empty())
 }
 
 /// 根据屏幕尺寸自适应计算窗口大小
@@ -819,19 +848,41 @@ mod tests {
     }
 
     #[test]
-    fn parse_set_cookie_value_extracts_first_cookie() {
-        let headers = "\
-HTTP/1.1 303 See Other\r
-cache-control: no-store\r
-location: /\r
-set-cookie: dsh-auth-x=v1.abc.def; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict\r
-\r
-";
+    fn refresh_reuses_the_authenticated_dsh_url() {
         assert_eq!(
-            parse_set_cookie_value(headers).as_deref(),
-            Some("dsh-auth-x=v1.abc.def; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict")
+            page_navigation_target(Some("http://127.0.0.1:3080/?token=abc")),
+            "http://127.0.0.1:3080/?token=abc"
         );
-        assert!(parse_set_cookie_value("HTTP/1.1 404 Not Found\r\n\r\n").is_none());
+        assert_eq!(page_navigation_target(None), DSH_URL);
+    }
+
+    #[test]
+    fn authentication_failure_is_retried_once() {
+        assert!(should_retry_auth_page("dsh web authentication required", 0));
+        assert!(!should_retry_auth_page(
+            "dsh web authentication required",
+            1
+        ));
+        assert!(!should_retry_auth_page("DeepSeek web app", 0));
+    }
+
+    #[test]
+    fn auth_retry_events_match_only_their_session() {
+        let state = AuthRetryState {
+            session: 2,
+            url: "http://127.0.0.1:3080/?token=abc".into(),
+            attempts: 0,
+        };
+        assert!(auth_retry_matches_session(Some(&state), 2));
+        assert!(!auth_retry_matches_session(Some(&state), 1));
+        assert!(!auth_retry_matches_session(None, 2));
+    }
+
+    #[test]
+    fn dsh_update_restarts_only_after_install_and_validation() {
+        assert_eq!(update_action(true, true), UpdateAction::Restart);
+        assert_eq!(update_action(false, true), UpdateAction::FailInstall);
+        assert_eq!(update_action(true, false), UpdateAction::FailValidation);
     }
 
     #[cfg(windows)]

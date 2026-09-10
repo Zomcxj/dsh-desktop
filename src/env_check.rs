@@ -204,6 +204,27 @@ pub fn latest_dsh_version() -> Option<String> {
     }
 }
 
+/// 验证全局 dsh 安装完整且可由当前 Node.js 执行。
+pub fn validate_dsh_installation() -> Result<String, String> {
+    let root = run_output("npm", &["root", "-g"])
+        .ok_or_else(|| "无法找到 npm 全局安装目录".to_string())?;
+    let dsh_dir = Path::new(&root).join("@deepseek-ai").join("dsh");
+    let package_json = dsh_dir.join("package.json");
+    let bin_path = dsh_dir.join("lib").join("bin.js");
+    if !package_json.exists() || !bin_path.exists() {
+        return Err("dsh 更新不完整：缺少 package.json 或 lib/bin.js".into());
+    }
+
+    let bin = bin_path.to_string_lossy().to_string();
+    let version = run_output("node", &[&bin, "--version"])
+        .ok_or_else(|| "dsh 更新后无法启动，请重试".to_string())?;
+    if version.trim().is_empty() {
+        Err("dsh 更新后未返回有效版本".into())
+    } else {
+        Ok(version)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +276,14 @@ mod tests {
             let _ = root;
             Path::new("C:\\global\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js")
         });
+    }
+
+    #[test]
+    fn validation_rejects_missing_installation_paths() {
+        let root = Path::new("C:\\global\\node_modules");
+        let dsh_dir = root.join("@deepseek-ai").join("dsh");
+        assert!(!dsh_dir.join("package.json").exists());
+        assert!(!dsh_dir.join("lib").join("bin.js").exists());
     }
 
     #[cfg(windows)]

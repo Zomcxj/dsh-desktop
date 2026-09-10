@@ -67,6 +67,7 @@ pub fn build_splash_html() -> String {
 <script>
   function setStatus(text) { document.getElementById('status').textContent = text; }
   function showFail(message) { setStatus(message); document.getElementById('spinner').classList.add('hidden'); document.getElementById('retry').classList.remove('hidden'); document.getElementById('exit').classList.remove('hidden'); }
+  function showUpdateFail(message) { showFail(message); var b=document.getElementById('retry'); b.textContent='重新更新'; b.onclick=function(){ b.disabled=true; b.textContent='正在更新...'; window.ipc.postMessage('update-dsh'); }; }
   function showDone() { document.getElementById('spinner').classList.add('hidden'); }
   function reset() { setStatus('正在初始化...'); document.getElementById('spinner').classList.remove('hidden'); document.getElementById('retry').classList.add('hidden'); document.getElementById('exit').classList.add('hidden'); document.getElementById('env-panel').style.display = 'none'; document.getElementById('env-list').innerHTML = ''; }
 
@@ -178,8 +179,9 @@ pub fn inject_navbar_script() -> String {
     + '.n-spacer{flex:1 1 auto;}'
     + '.n-dot{position:absolute;top:1px;right:1px;width:6px;height:6px;border-radius:50%;background:#ff4444;display:none;}'
     + '.n-dot.show{display:block;}'
-    + '.n-prompt{position:fixed;bottom:60px;left:50%;transform:translateX(-50%);background:#2a2a2a;border:1px solid #555;border-radius:6px;padding:8px 16px;font-size:12px;color:#eee;display:none;z-index:2147483647;font-family:"Segoe UI",system-ui,sans-serif;white-space:nowrap;pointer-events:auto;cursor:pointer;}'
-    + '.n-prompt.show{display:flex;align-items:center;gap:8px;}'
+     + '.n-prompt{position:fixed;bottom:60px;left:50%;transform:translateX(-50%);background:#2a2a2a;border:1px solid #555;border-radius:6px;padding:8px 16px;font-size:12px;color:#eee;display:none;z-index:2147483647;font-family:"Segoe UI",system-ui,sans-serif;white-space:nowrap;pointer-events:auto;cursor:pointer;}'
+     + '.n-prompt.show{display:flex;align-items:center;gap:8px;}'
+     + '.n-update-action{color:#4d6bfe;text-decoration:underline;cursor:pointer;}'
     + '.n-prompt:hover{background:#3a3a3a;}'
     + '</style>'
     + '<div class="bar">'
@@ -206,30 +208,38 @@ pub fn inject_navbar_script() -> String {
     + '</button>'
     + '<span class="n-spacer"></span>'
     + '</div>'
-    + '<div class="n-prompt" id="dsh-update-prompt">已更新，<span style="color:#4d6bfe;text-decoration:underline;">点击重启</span></div>';
+     + '<div class="n-prompt" id="dsh-update-prompt">发现 dsh 新版本，<span class="n-update-action" data-cmd="update-dsh">点击更新</span><span class="n-update-action" data-cmd="dismiss-dsh-update">无脑进入</span></div>';
 
   // 更新红点提示函数
-  window.showUpdateDot = function() {
+   window.showUpdateDot = function() {
     var dot = root.getElementById('dsh-update-dot');
     if (dot) dot.classList.add('show');
     var prompt = root.getElementById('dsh-update-prompt');
-    if (prompt) prompt.classList.add('show');
-  };
+     if (prompt) prompt.classList.add('show');
+   };
 
-  // 更新提示点击重启
-  root.getElementById('dsh-update-prompt').addEventListener('click', function() {
-    if (window.ipc && window.ipc.postMessage) { window.ipc.postMessage('restart'); }
-  });
+   window.dismissUpdateDot = function() {
+     var dot = root.getElementById('dsh-update-dot');
+     if (dot) dot.classList.remove('show');
+     var prompt = root.getElementById('dsh-update-prompt');
+     if (prompt) prompt.classList.remove('show');
+   };
 
-  // 点击事件：Shadow DOM 内的按钮通过 data-cmd 通知宿主 IPC
-  root.querySelector('.bar').addEventListener('click', function(e){
+   // 点击事件：Shadow DOM 内的按钮通过 data-cmd 通知宿主 IPC
+   root.querySelector('.bar').addEventListener('click', function(e){
     var btn = e.target.closest ? e.target.closest('.n-btn') : null;
     if (btn && btn.dataset && btn.dataset.cmd) {
       var msg = btn.dataset.cmd;
       if (window.ipc && window.ipc.postMessage) { window.ipc.postMessage(msg); }
       else if (window.parent && window.parent.ipc && window.parent.ipc.postMessage) { window.parent.ipc.postMessage(msg); }
-    }
-  });
+     }
+   });
+   root.getElementById('dsh-update-prompt').addEventListener('click', function(e) {
+     var action = e.target.closest ? e.target.closest('.n-update-action') : null;
+     if (action && action.dataset && action.dataset.cmd && window.ipc && window.ipc.postMessage) {
+       window.ipc.postMessage(action.dataset.cmd);
+     }
+   });
 
   // 挂到 html 根元素（比 body 更不容易被插件容器包裹/加 transform）
   (document.documentElement || document.body).appendChild(host);
@@ -351,5 +361,15 @@ mod tests {
     fn ui_messages_produce_javascript() {
         assert!(ui_msg_js(&UiMsg::Step("检查端口".into())).contains("检查端口"));
         assert!(ui_msg_js(&UiMsg::Fail("出错了".into())).contains("出错了"));
+    }
+
+    #[test]
+    fn splash_supports_explicit_dsh_update() {
+        let html = build_splash_html();
+        assert!(html.contains("update-dsh"));
+        assert!(html.contains("showUpdateFail"));
+        let navbar = inject_navbar_script();
+        assert!(navbar.contains("无脑进入"));
+        assert!(navbar.contains("dismiss-dsh-update"));
     }
 }
