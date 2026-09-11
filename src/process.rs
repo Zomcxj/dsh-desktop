@@ -14,17 +14,10 @@ pub fn output(command: &mut Command, timeout: Duration) -> Option<Output> {
 }
 
 pub fn status(command: &mut Command, timeout: Duration) -> bool {
-    let Ok(mut child) = command
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+    let Ok(mut child) = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() else {
         return false;
     };
-    wait(&mut child, timeout)
-        && child
-            .wait()
-            .is_ok_and(|status| status.success())
+    wait(&mut child, timeout) && child.wait().is_ok_and(|status| status.success())
 }
 
 fn wait(child: &mut Child, timeout: Duration) -> bool {

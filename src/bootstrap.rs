@@ -1,6 +1,6 @@
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::checker;
 use crate::dsh_process::DshProcess;
@@ -11,7 +11,7 @@ pub const DSH_URL: &str = "http://127.0.0.1:3080";
 pub const DSH_HOST: &str = "127.0.0.1";
 pub const DSH_PORT: u16 = 3080;
 pub const READY_TIMEOUT: Duration = Duration::from_secs(60);
-pub const READY_POLL: Duration = Duration::from_millis(500);
+pub const READY_POLL: Duration = Duration::from_millis(100);
 
 pub fn direct_launch_event_order() -> [&'static str; 4] {
     [
@@ -130,7 +130,11 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
     send_step(&tx, direct_launch_event_order()[0]);
     // 环境检查：Node.js / npm / dsh（逐项进行，带过程动画）
     let mut results = Vec::with_capacity(3);
-    for check in [env_check::check_node, env_check::check_npm, env_check::check_dsh] {
+    for check in [
+        env_check::check_node,
+        env_check::check_npm,
+        env_check::check_dsh,
+    ] {
         if control.is_cancelled() {
             return;
         }
@@ -181,8 +185,9 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
         return;
     }
 
-    send_step(&tx, direct_launch_event_order()[3]);
-    let mut elapsed = Duration::ZERO;
+    let started = Instant::now();
+    let mut displayed = Duration::ZERO;
+    let _ = tx.send(UiMsg::Step(ready_wait_status(displayed)));
     loop {
         let http_ready = checker::http_ready(DSH_HOST, DSH_PORT, READY_POLL);
         let url_ready = process.authenticated_url().is_some();
@@ -197,8 +202,12 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
             process.stop();
             return;
         }
-        std::thread::sleep(READY_POLL);
-        elapsed += READY_POLL;
+        let elapsed = started.elapsed();
+        let next_display = Duration::from_millis((elapsed.as_millis() / 100) as u64 * 100);
+        if next_display > displayed {
+            displayed = next_display;
+            let _ = tx.send(UiMsg::Step(ready_wait_status(displayed)));
+        }
         if control.is_cancelled() {
             process.stop();
             return;
@@ -207,6 +216,10 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
             process.stop();
             let _ = tx.send(UiMsg::Fail("等待 dsh 服务就绪超时 (60s)".into()));
             return;
+        }
+        let next_tick = displayed + READY_POLL;
+        if elapsed < next_tick {
+            std::thread::sleep(next_tick - elapsed);
         }
     }
     if control.is_cancelled() {
@@ -218,6 +231,10 @@ pub fn run_bootstrap(tx: Sender<UiMsg>, control: &BootstrapControl) {
 
 fn send_step(tx: &Sender<UiMsg>, message: &str) {
     let _ = tx.send(UiMsg::Step(message.into()));
+}
+
+fn ready_wait_status(elapsed: Duration) -> String {
+    format!("等待服务就绪... {:.1}s", elapsed.as_secs_f64())
 }
 
 #[cfg(test)]
@@ -272,6 +289,19 @@ mod tests {
                 "正在启动 dsh web 服务...",
                 "等待服务就绪...",
             ]
+        );
+    }
+
+    #[test]
+    fn ready_wait_status_formats_elapsed_seconds_with_one_decimal() {
+        assert_eq!(ready_wait_status(Duration::ZERO), "等待服务就绪... 0.0s");
+        assert_eq!(
+            ready_wait_status(Duration::from_millis(100)),
+            "等待服务就绪... 0.1s"
+        );
+        assert_eq!(
+            ready_wait_status(Duration::from_secs(12) + Duration::from_millis(345)),
+            "等待服务就绪... 12.3s"
         );
     }
 

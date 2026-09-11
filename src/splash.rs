@@ -277,7 +277,11 @@ pub fn inject_navbar_script() -> String {
 /// 更新导航栏按钮状态
 pub fn nav_set_exit_mode(enabled: bool) -> String {
     let active_class = if enabled { " active" } else { "" };
-    let tip = if enabled { "关闭时退出 ✓" } else { "关闭时隐藏" };
+    let tip = if enabled {
+        "关闭时退出 ✓"
+    } else {
+        "关闭时隐藏"
+    };
     format!(
         "(function(){{var h=document.getElementById('dsh-navbar-host');var r=h?h.shadowRoot:null;var b=r?r.getElementById('dsh-btn-exit'):null;if(b){{b.className='n-btn{ac}'}};
         var t=b?b.querySelector('.n-tip'):null;if(t)t.textContent='{tip}';}})();",
@@ -288,7 +292,11 @@ pub fn nav_set_exit_mode(enabled: bool) -> String {
 
 pub fn nav_set_tray_mode(enabled: bool) -> String {
     let active_class = if enabled { " active" } else { "" };
-    let tip = if enabled { "常驻任务栏 ✓" } else { "不驻任务栏" };
+    let tip = if enabled {
+        "常驻任务栏 ✓"
+    } else {
+        "不驻任务栏"
+    };
     format!(
         "(function(){{var h=document.getElementById('dsh-navbar-host');var r=h?h.shadowRoot:null;var b=r?r.getElementById('dsh-btn-tray'):null;if(b){{b.className='n-btn{ac}'}};
         var t=b?b.querySelector('.n-tip'):null;if(t)t.textContent='{tip}';}})();",

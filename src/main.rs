@@ -12,7 +12,9 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use bootstrap::{run_bootstrap, BootstrapControl, BootstrapState, UiMsg, DSH_URL};
 use dsh_process::DshProcess;
-use splash::{apply_msg, build_splash_html, inject_navbar_script, nav_set_exit_mode, nav_set_tray_mode};
+use splash::{
+    apply_msg, build_splash_html, inject_navbar_script, nav_set_exit_mode, nav_set_tray_mode,
+};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{
     ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget,
@@ -45,6 +47,7 @@ enum UserEvent {
     DismissDshUpdate,
     AuthPageProbe(u64, String),
     AuthRetry(u64),
+    HideStartupOverlay,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -57,6 +60,7 @@ enum DesktopAction {
 struct DesktopState {
     window: Window,
     webview: wry::WebView,
+    splash_webview: wry::WebView,
     _web_context: WebContext,
     _tray: TrayIcon,
 }
@@ -105,7 +109,14 @@ fn main() -> wry::Result<()> {
         // 不杀自己
         let self_pid = std::process::id();
         let _ = std::process::Command::new("taskkill")
-            .args(["/FI", &format!("PID ne {self_pid}"), "/IM", "dsh-desktop.exe", "/T", "/F"])
+            .args([
+                "/FI",
+                &format!("PID ne {self_pid}"),
+                "/IM",
+                "dsh-desktop.exe",
+                "/T",
+                "/F",
+            ])
             .creation_flags(0x0800_0000)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -123,7 +134,8 @@ fn main() -> wry::Result<()> {
     MenuEvent::set_event_handler(Some(move |event| {
         let _ = menu_event_proxy.send_event(UserEvent::Menu(event));
     }));
-    let desktop = open_desktop(&event_loop, proxy.clone(), proxy.clone()).map_err(std::io::Error::other)?;
+    let desktop =
+        open_desktop(&event_loop, proxy.clone(), proxy.clone()).map_err(std::io::Error::other)?;
     let managed_process = Arc::new(Mutex::new(None::<DshProcess>));
     let bootstrap_state = Arc::new(BootstrapState::default());
     let bootstrap_control = BootstrapControl::new();
@@ -203,7 +215,7 @@ fn main() -> wry::Result<()> {
                         }
                     }
                     message => {
-                        let _ = apply_msg(&desktop.webview, &message);
+                        let _ = apply_msg(&desktop.splash_webview, &message);
                     }
                 }
             }
@@ -228,7 +240,9 @@ fn main() -> wry::Result<()> {
             Event::UserEvent(UserEvent::Retry) => {
                 if let Some(generation) = bootstrap_state.start() {
                     auth_retry = None;
-                    let _ = desktop.webview.evaluate_script("reset();");
+                    let _ = desktop.splash_webview.evaluate_script("reset();");
+                    let _ = desktop.webview.set_visible(false);
+                    let _ = desktop.splash_webview.set_visible(true);
                     launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
                 }
             }
@@ -259,9 +273,9 @@ fn main() -> wry::Result<()> {
                     process.stop();
                 }
                 // 回到启动页，让用户看到重启过程
-                let _ = desktop
-                    .webview
-                    .load_html(&build_splash_html());
+                let _ = desktop.splash_webview.load_html(&build_splash_html());
+                let _ = desktop.webview.set_visible(false);
+                let _ = desktop.splash_webview.set_visible(true);
                 // 重新启动
                 if let Some(generation) = bootstrap_state.start() {
                     launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
@@ -292,20 +306,25 @@ fn main() -> wry::Result<()> {
             Event::UserEvent(UserEvent::PageLoaded(url)) => {
                 if url.starts_with(DSH_URL) {
                     inject_navbar_to_desktop(&desktop, &settings_clone);
-                    if auth_retry.is_some() {
-                        let probe_proxy = event_proxy.clone();
-                        let session = auth_retry.as_ref().map(|state| state.session);
-                        if let Some(session) = session {
-                            let _ = desktop.webview.evaluate_script_with_callback(
-                                "(document.title || '') + '\\n' + (document.body ? document.body.innerText : '')",
-                                move |text| {
-                                    let _ = probe_proxy
-                                        .send_event(UserEvent::AuthPageProbe(session, text));
-                                },
-                            );
-                        }
-                    }
+                    let probe_proxy = event_proxy.clone();
+                    let session = auth_retry.as_ref().map(|state| state.session);
+                    let _ = desktop.webview.evaluate_script_with_callback(
+                        "(document.title || '') + '\\n' + (document.body ? document.body.innerText : '')",
+                        move |text| {
+                            if should_hide_startup_overlay(&text) {
+                                let _ = probe_proxy.send_event(UserEvent::HideStartupOverlay);
+                            }
+                            if let Some(session) = session {
+                                let _ = probe_proxy.send_event(UserEvent::AuthPageProbe(session, text));
+                            }
+                        },
+                    );
                 }
+            }
+            Event::UserEvent(UserEvent::HideStartupOverlay) => {
+                auth_retry = None;
+                let _ = desktop.splash_webview.set_visible(false);
+                let _ = desktop.webview.set_visible(true);
             }
             Event::UserEvent(UserEvent::AuthPageProbe(session, text)) => {
                 if auth_retry_matches_session(auth_retry.as_ref(), session) {
@@ -393,19 +412,21 @@ fn main() -> wry::Result<()> {
                     };
                     let _ = update_proxy.send_event(UserEvent::DshUpdateFinished(result));
                 });
-                let _ = desktop.webview.load_html(&build_splash_html());
+                let _ = desktop.splash_webview.load_html(&build_splash_html());
+                let _ = desktop.webview.set_visible(false);
+                let _ = desktop.splash_webview.set_visible(true);
             }
             Event::UserEvent(UserEvent::DshUpdateFinished(result)) => {
                 dsh_update_in_progress = false;
                 match result {
                     Ok(_) => {
-                        let _ = desktop.webview.load_html(&build_splash_html());
+                        let _ = desktop.splash_webview.load_html(&build_splash_html());
                         if let Some(generation) = bootstrap_state.start() {
                             launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
                         }
                     }
                     Err(error) => {
-                        let _ = desktop.webview.load_html(&build_splash_html());
+                        let _ = desktop.splash_webview.load_html(&build_splash_html());
                         let failure_proxy = event_proxy.clone();
                         std::thread::spawn(move || {
                             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -416,14 +437,14 @@ fn main() -> wry::Result<()> {
             }
             Event::UserEvent(UserEvent::ShowUpdateFailure(error)) => {
                 let _ = desktop
-                    .webview
+                    .splash_webview
                     .evaluate_script(&format!("showUpdateFail({error:?});"));
             }
             Event::UserEvent(UserEvent::DismissDshUpdate) => {
-                let _ = desktop.webview.evaluate_script("dismissUpdateDot();");
+                let _ = desktop.splash_webview.evaluate_script("dismissUpdateDot();");
             }
             Event::UserEvent(UserEvent::UpdateAvailable(true)) => {
-                let _ = desktop.webview.evaluate_script(
+                let _ = desktop.splash_webview.evaluate_script(
                     r#"showUpdateDot();"#,
                 );
             }
@@ -433,13 +454,13 @@ fn main() -> wry::Result<()> {
                 if success {
                     // 自动重新检查环境并继续启动
                     if let Some(generation) = bootstrap_state.start() {
-                        let _ = desktop.webview.evaluate_script("reset();");
+                        let _ = desktop.splash_webview.evaluate_script("reset();");
                         launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
                     }
                 } else {
                     let msg = format!("{which} 安装失败，请按安装方式手动安装后重试");
-                    let _ = desktop.webview.evaluate_script(&format!("setStatus({msg:?});"));
-                    let _ = desktop.webview.evaluate_script(
+                    let _ = desktop.splash_webview.evaluate_script(&format!("setStatus({msg:?});"));
+                    let _ = desktop.splash_webview.evaluate_script(
                         "var b=document.querySelector('.env-btn[disabled]');if(b){b.disabled=false;b.textContent='自动安装';}",
                     );
                 }
@@ -496,38 +517,39 @@ fn open_desktop(
     let local_app_data = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| "未设置 LOCALAPPDATA 环境变量".to_string())?;
     let mut web_context = WebContext::new(Some(webview_data_directory(Path::new(&local_app_data))));
+    let main_proxy = proxy.clone();
     let webview = WebViewBuilder::new_with_web_context(&mut web_context)
-        .with_html(build_splash_html())
+        .with_visible(false)
         .with_ipc_handler(move |request| match request.body().as_str() {
             "retry" => {
-                let _ = proxy.send_event(UserEvent::Retry);
+                let _ = main_proxy.send_event(UserEvent::Retry);
             }
             "exit" => {
-                let _ = proxy.send_event(UserEvent::Exit);
+                let _ = main_proxy.send_event(UserEvent::Exit);
             }
             "refresh" => {
-                let _ = proxy.send_event(UserEvent::RefreshPage);
+                let _ = main_proxy.send_event(UserEvent::RefreshPage);
             }
             "restart" => {
-                let _ = proxy.send_event(UserEvent::RestartService);
+                let _ = main_proxy.send_event(UserEvent::RestartService);
             }
             "toggle-exit-mode" => {
-                let _ = proxy.send_event(UserEvent::ToggleExitOnClose);
+                let _ = main_proxy.send_event(UserEvent::ToggleExitOnClose);
             }
             "toggle-tray" => {
-                let _ = proxy.send_event(UserEvent::ToggleTray);
+                let _ = main_proxy.send_event(UserEvent::ToggleTray);
             }
             "install-node" => {
-                let _ = proxy.send_event(UserEvent::InstallNode);
+                let _ = main_proxy.send_event(UserEvent::InstallNode);
             }
             "install-dsh" => {
-                let _ = proxy.send_event(UserEvent::InstallDsh);
+                let _ = main_proxy.send_event(UserEvent::InstallDsh);
             }
             "update-dsh" => {
-                let _ = proxy.send_event(UserEvent::InstallDshUpdate);
+                let _ = main_proxy.send_event(UserEvent::InstallDshUpdate);
             }
             "dismiss-dsh-update" => {
-                let _ = proxy.send_event(UserEvent::DismissDshUpdate);
+                let _ = main_proxy.send_event(UserEvent::DismissDshUpdate);
             }
             _ => {}
         })
@@ -541,6 +563,33 @@ fn open_desktop(
         })
         .build(&window)
         .map_err(|error| format!("创建主 WebView 失败: {error}"))?;
+
+    let splash_proxy = proxy.clone();
+    let splash_webview = WebViewBuilder::new_with_web_context(&mut web_context)
+        .with_html(build_splash_html())
+        .with_ipc_handler(move |request| match request.body().as_str() {
+            "retry" => {
+                let _ = splash_proxy.send_event(UserEvent::Retry);
+            }
+            "exit" => {
+                let _ = splash_proxy.send_event(UserEvent::Exit);
+            }
+            "update-dsh" => {
+                let _ = splash_proxy.send_event(UserEvent::InstallDshUpdate);
+            }
+            "dismiss-dsh-update" => {
+                let _ = splash_proxy.send_event(UserEvent::DismissDshUpdate);
+            }
+            "install-node" => {
+                let _ = splash_proxy.send_event(UserEvent::InstallNode);
+            }
+            "install-dsh" => {
+                let _ = splash_proxy.send_event(UserEvent::InstallDsh);
+            }
+            _ => {}
+        })
+        .build(&window)
+        .map_err(|error| format!("创建启动遮罩失败: {error}"))?;
 
     let icon = tray_icon()?;
     let menu = Menu::new();
@@ -561,6 +610,7 @@ fn open_desktop(
     Ok(DesktopState {
         window,
         webview,
+        splash_webview,
         _web_context: web_context,
         _tray: tray,
     })
@@ -584,6 +634,11 @@ fn should_retry_auth_page(text: &str, attempts: u8) -> bool {
 
 fn auth_retry_matches_session(state: Option<&AuthRetryState>, session: u64) -> bool {
     state.is_some_and(|state| state.session == session)
+}
+
+fn should_hide_startup_overlay(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    !normalized.is_empty() && !normalized.contains("authentication required")
 }
 
 fn update_action(install_ok: bool, validation_ok: bool) -> UpdateAction {
@@ -751,10 +806,7 @@ fn exit_application(
 }
 
 /// 注入导航栏到桌面页面并同步设置状态
-fn inject_navbar_to_desktop(
-    desktop: &DesktopState,
-    settings: &Arc<Mutex<AppSettings>>,
-) {
+fn inject_navbar_to_desktop(desktop: &DesktopState, settings: &Arc<Mutex<AppSettings>>) {
     let s = settings.lock().expect("settings lock poisoned");
     let mut js = inject_navbar_script();
     js.push_str(&nav_set_exit_mode(s.exit_on_close));
@@ -883,6 +935,15 @@ mod tests {
         assert_eq!(update_action(true, true), UpdateAction::Restart);
         assert_eq!(update_action(false, true), UpdateAction::FailInstall);
         assert_eq!(update_action(true, false), UpdateAction::FailValidation);
+    }
+
+    #[test]
+    fn startup_overlay_hides_only_after_authenticated_page_load() {
+        assert!(!should_hide_startup_overlay(
+            "dsh web authentication required"
+        ));
+        assert!(!should_hide_startup_overlay(""));
+        assert!(should_hide_startup_overlay("DeepSeek Harness"));
     }
 
     #[cfg(windows)]

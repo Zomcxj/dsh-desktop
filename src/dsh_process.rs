@@ -38,8 +38,10 @@ impl DshProcess {
             child.stdout.take().expect("stdout was configured as piped"),
             Some(authenticated_url.clone()),
         );
-        let stderr_reader =
-            drain_output(child.stderr.take().expect("stderr was configured as piped"), None);
+        let stderr_reader = drain_output(
+            child.stderr.take().expect("stderr was configured as piped"),
+            None,
+        );
         Ok(Self {
             managed: true,
             pid: Some(pid),
@@ -87,10 +89,7 @@ impl DshProcess {
                 use std::os::windows::process::CommandExt;
                 command.creation_flags(CREATE_NO_WINDOW);
             }
-            let _ = command
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
         }
     }
 
@@ -250,7 +249,11 @@ mod tests {
 
         assert_eq!(command.get_program(), "node");
         let args: Vec<_> = command.get_args().collect();
-        assert_eq!(args.len(), 3, "应有三个参数: bin.js 路径、'web' 和 '--no-open'");
+        assert_eq!(
+            args.len(),
+            3,
+            "应有三个参数: bin.js 路径、'web' 和 '--no-open'"
+        );
         assert!(
             args[0].to_string_lossy().ends_with("bin.js"),
             "第一个参数应以 bin.js 结尾: {}",
@@ -351,7 +354,8 @@ mod tests {
 
     #[test]
     fn authenticated_url_is_extracted_from_startup_line() {
-        let line = "dsh web: http://127.0.0.1:3080/?token=abc (LAN: http://192.168.1.2:3080/?token=abc)";
+        let line =
+            "dsh web: http://127.0.0.1:3080/?token=abc (LAN: http://192.168.1.2:3080/?token=abc)";
         assert_eq!(
             authenticated_url_from_line(line).as_deref(),
             Some("http://127.0.0.1:3080/?token=abc")
