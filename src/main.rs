@@ -13,7 +13,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use bootstrap::{run_bootstrap, BootstrapControl, BootstrapState, UiMsg, DSH_URL};
 use dsh_process::DshProcess;
 use splash::{
-    apply_msg, build_splash_html, inject_navbar_script, nav_set_exit_mode, nav_set_tray_mode,
+    apply_msg, auth_cover_script, build_splash_html, inject_navbar_script, nav_set_exit_mode,
+    nav_set_tray_mode,
 };
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{
@@ -45,9 +46,6 @@ enum UserEvent {
     DshUpdateFinished(Result<String, String>),
     ShowUpdateFailure(String),
     DismissDshUpdate,
-    AuthPageProbe(u64, String),
-    AuthRetry(u64),
-    HideStartupOverlay,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -60,7 +58,6 @@ enum DesktopAction {
 struct DesktopState {
     window: Window,
     webview: wry::WebView,
-    splash_webview: wry::WebView,
     _web_context: WebContext,
     _tray: TrayIcon,
 }
@@ -77,11 +74,6 @@ enum UpdateAction {
     FailValidation,
 }
 
-struct AuthRetryState {
-    session: u64,
-    url: String,
-    attempts: u8,
-}
 
 impl AppSettings {
     fn new() -> Self {
@@ -99,6 +91,28 @@ struct WindowGeometry {
     minimum_width: f64,
     minimum_height: f64,
     resizable: bool,
+}
+
+/// 比较两个版本号，返回 true 如果 remote > local
+fn is_newer_version(local: &str, remote: &str) -> bool {
+    let parse_version = |v: &str| -> Option<(u32, u32, u32)> {
+        let clean = v.trim().split('-').next()?; // 去掉 -alpha, -rc.2 等后缀
+        let parts: Vec<&str> = clean.split('.').collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let major = parts[0].parse().ok()?;
+        let minor = parts[1].parse().ok()?;
+        let patch = parts[2].parse().ok()?;
+        Some((major, minor, patch))
+    };
+    
+    match (parse_version(local), parse_version(remote)) {
+        (Some((lmaj, lmin, lpatch)), Some((rmaj, rmin, rpatch))) => {
+            (rmaj, rmin, rpatch) > (lmaj, lmin, lpatch)
+        }
+        _ => false, // 解析失败则不提示更新
+    }
 }
 
 fn main() -> wry::Result<()> {
@@ -145,8 +159,6 @@ fn main() -> wry::Result<()> {
     let settings = Arc::new(Mutex::new(AppSettings::new()));
     let settings_clone = settings.clone();
     launch_bootstrap(proxy, bootstrap_control.clone(), initial_generation);
-    let mut auth_retry = None::<AuthRetryState>;
-    let mut auth_session = 0_u64;
     let mut dsh_update_in_progress = false;
 
     event_loop.run(move |event, _event_loop, control_flow| {
@@ -166,56 +178,48 @@ fn main() -> wry::Result<()> {
                         let target = process
                             .authenticated_url()
                             .unwrap_or_else(|| DSH_URL.to_string());
-                        auth_session += 1;
-                        auth_retry = target.contains("token=").then(|| AuthRetryState {
-                            session: auth_session,
-                            url: target.clone(),
-                            attempts: 0,
-                        });
-                        // 直接打开 token URL，让 WebView 接收 dsh 返回的 HttpOnly cookie。
-                        if let Err(error) =
-                            desktop.webview.evaluate_script(&navigation_script(&target))
-                        {
-                            process.stop();
-                            if let Some(process) = managed_process
-                                .lock()
-                                .expect("managed process lock poisoned")
-                                .take()
-                            {
-                                process.stop();
-                            }
-                            auth_retry = None;
+                        *managed_process
+                            .lock()
+                            .expect("managed process lock poisoned") = Some(process);
+                        let _ = apply_msg(
+                            &desktop.webview,
+                            &UiMsg::Step("正在进入主界面...".into()),
+                        );
+                        if let Err(error) = desktop.webview.load_url(&target) {
                             let _ = apply_msg(
                                 &desktop.webview,
                                 &UiMsg::Fail(format!("加载主界面失败: {error}")),
                             );
                         } else {
-                            *managed_process
-                                .lock()
-                                .expect("managed process lock poisoned") = Some(process);
-                            // 延迟注入导航栏（备选，on_page_load 可能不触发）
                             let delayed_proxy = event_proxy.clone();
                             std::thread::spawn(move || {
                                 std::thread::sleep(std::time::Duration::from_secs(2));
                                 let _ = delayed_proxy.send_event(UserEvent::InjectNavbar);
                             });
-                            // 后台只检查更新，不在 dsh 运行时修改全局 node_modules。
-                            let update_proxy = event_proxy.clone();
-                            std::thread::spawn(move || {
-                                if let Some(_latest) = crate::env_check::latest_dsh_version() {
-                                    let local = crate::env_check::check_dsh();
-                                    let needs_update = local.ok
-                                        && local.version.as_deref().map(|v| v.trim())
-                                            != Some(_latest.trim());
-                                    if needs_update {
-                                        let _ = update_proxy.send_event(UserEvent::UpdateAvailable(true));
-                                    }
-                                }
-                            });
                         }
+                        // 后台只检查更新，不在 dsh 运行时修改全局 node_modules。
+                        let update_proxy = event_proxy.clone();
+                        std::thread::spawn(move || {
+                            if let Some(_latest) = crate::env_check::latest_dsh_version() {
+                                let local = crate::env_check::check_dsh();
+                                // 使用自定义版本比较：只有远程版本 > 本地版本时才提示更新
+                                let needs_update = if local.ok {
+                                    if let Some(local_ver) = local.version.as_deref() {
+                                        is_newer_version(local_ver, &_latest)
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+                                if needs_update {
+                                    let _ = update_proxy.send_event(UserEvent::UpdateAvailable(true));
+                                }
+                            }
+                        });
                     }
                     message => {
-                        let _ = apply_msg(&desktop.splash_webview, &message);
+                        let _ = apply_msg(&desktop.webview, &message);
                     }
                 }
             }
@@ -239,10 +243,8 @@ fn main() -> wry::Result<()> {
             },
             Event::UserEvent(UserEvent::Retry) => {
                 if let Some(generation) = bootstrap_state.start() {
-                    auth_retry = None;
-                    let _ = desktop.splash_webview.evaluate_script("reset();");
-                    let _ = desktop.webview.set_visible(false);
-                    let _ = desktop.splash_webview.set_visible(true);
+                    let _ = desktop.webview.load_html(&build_splash_html());
+                    let _ = desktop.webview.evaluate_script("reset();");
                     launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
                 }
             }
@@ -250,7 +252,6 @@ fn main() -> wry::Result<()> {
                 exit_application(&bootstrap_control, &managed_process, control_flow)
             }
             Event::UserEvent(UserEvent::RefreshPage) => {
-                auth_retry = None;
                 let target = managed_process
                     .lock()
                     .expect("managed process lock poisoned")
@@ -264,7 +265,6 @@ fn main() -> wry::Result<()> {
             }
             Event::UserEvent(UserEvent::RestartService) => {
                 // 停止当前服务
-                auth_retry = None;
                 if let Some(process) = managed_process
                     .lock()
                     .expect("managed process lock poisoned")
@@ -273,9 +273,7 @@ fn main() -> wry::Result<()> {
                     process.stop();
                 }
                 // 回到启动页，让用户看到重启过程
-                let _ = desktop.splash_webview.load_html(&build_splash_html());
-                let _ = desktop.webview.set_visible(false);
-                let _ = desktop.splash_webview.set_visible(true);
+                let _ = desktop.webview.load_html(&build_splash_html());
                 // 重新启动
                 if let Some(generation) = bootstrap_state.start() {
                     launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
@@ -304,50 +302,9 @@ fn main() -> wry::Result<()> {
                     .evaluate_script(&nav_set_tray_mode(settings.tray_enabled));
             }
             Event::UserEvent(UserEvent::PageLoaded(url)) => {
-                if url.starts_with(DSH_URL) {
+                let _ = desktop.webview.evaluate_script(auth_cover_script());
+                if url.starts_with(DSH_URL) && !url.contains("token=") {
                     inject_navbar_to_desktop(&desktop, &settings_clone);
-                    let probe_proxy = event_proxy.clone();
-                    let session = auth_retry.as_ref().map(|state| state.session);
-                    let _ = desktop.webview.evaluate_script_with_callback(
-                        "(document.title || '') + '\\n' + (document.body ? document.body.innerText : '')",
-                        move |text| {
-                            if should_hide_startup_overlay(&text) {
-                                let _ = probe_proxy.send_event(UserEvent::HideStartupOverlay);
-                            }
-                            if let Some(session) = session {
-                                let _ = probe_proxy.send_event(UserEvent::AuthPageProbe(session, text));
-                            }
-                        },
-                    );
-                }
-            }
-            Event::UserEvent(UserEvent::HideStartupOverlay) => {
-                auth_retry = None;
-                let _ = desktop.splash_webview.set_visible(false);
-                let _ = desktop.webview.set_visible(true);
-            }
-            Event::UserEvent(UserEvent::AuthPageProbe(session, text)) => {
-                if auth_retry_matches_session(auth_retry.as_ref(), session) {
-                    let should_retry = auth_retry.as_ref().is_some_and(|state| {
-                        should_retry_auth_page(&text, state.attempts)
-                    });
-                    if should_retry {
-                        if let Some(state) = auth_retry.as_mut() {
-                            state.attempts += 1;
-                        }
-                        let retry_proxy = event_proxy.clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                            let _ = retry_proxy.send_event(UserEvent::AuthRetry(session));
-                        });
-                    } else if !text.to_ascii_lowercase().contains("authentication required") {
-                        auth_retry = None;
-                    }
-                }
-            }
-            Event::UserEvent(UserEvent::AuthRetry(session)) => {
-                if let Some(state) = auth_retry.as_ref().filter(|state| state.session == session) {
-                    let _ = desktop.webview.evaluate_script(&navigation_script(&state.url));
                 }
             }
             Event::UserEvent(UserEvent::InjectNavbar) => {
@@ -389,7 +346,6 @@ fn main() -> wry::Result<()> {
                     return;
                 }
                 dsh_update_in_progress = true;
-                auth_retry = None;
                 if let Some(process) = managed_process
                     .lock()
                     .expect("managed process lock poisoned")
@@ -412,21 +368,19 @@ fn main() -> wry::Result<()> {
                     };
                     let _ = update_proxy.send_event(UserEvent::DshUpdateFinished(result));
                 });
-                let _ = desktop.splash_webview.load_html(&build_splash_html());
-                let _ = desktop.webview.set_visible(false);
-                let _ = desktop.splash_webview.set_visible(true);
+                let _ = desktop.webview.load_html(&build_splash_html());
             }
             Event::UserEvent(UserEvent::DshUpdateFinished(result)) => {
                 dsh_update_in_progress = false;
                 match result {
                     Ok(_) => {
-                        let _ = desktop.splash_webview.load_html(&build_splash_html());
+                        let _ = desktop.webview.load_html(&build_splash_html());
                         if let Some(generation) = bootstrap_state.start() {
                             launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
                         }
                     }
                     Err(error) => {
-                        let _ = desktop.splash_webview.load_html(&build_splash_html());
+                        let _ = desktop.webview.load_html(&build_splash_html());
                         let failure_proxy = event_proxy.clone();
                         std::thread::spawn(move || {
                             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -437,14 +391,14 @@ fn main() -> wry::Result<()> {
             }
             Event::UserEvent(UserEvent::ShowUpdateFailure(error)) => {
                 let _ = desktop
-                    .splash_webview
+                    .webview
                     .evaluate_script(&format!("showUpdateFail({error:?});"));
             }
             Event::UserEvent(UserEvent::DismissDshUpdate) => {
-                let _ = desktop.splash_webview.evaluate_script("dismissUpdateDot();");
+                let _ = desktop.webview.evaluate_script("dismissUpdateDot();");
             }
             Event::UserEvent(UserEvent::UpdateAvailable(true)) => {
-                let _ = desktop.splash_webview.evaluate_script(
+                let _ = desktop.webview.evaluate_script(
                     r#"showUpdateDot();"#,
                 );
             }
@@ -454,13 +408,13 @@ fn main() -> wry::Result<()> {
                 if success {
                     // 自动重新检查环境并继续启动
                     if let Some(generation) = bootstrap_state.start() {
-                        let _ = desktop.splash_webview.evaluate_script("reset();");
+                        let _ = desktop.webview.evaluate_script("reset();");
                         launch_bootstrap(event_proxy.clone(), bootstrap_control.clone(), generation);
                     }
                 } else {
                     let msg = format!("{which} 安装失败，请按安装方式手动安装后重试");
-                    let _ = desktop.splash_webview.evaluate_script(&format!("setStatus({msg:?});"));
-                    let _ = desktop.splash_webview.evaluate_script(
+                    let _ = desktop.webview.evaluate_script(&format!("setStatus({msg:?});"));
+                    let _ = desktop.webview.evaluate_script(
                         "var b=document.querySelector('.env-btn[disabled]');if(b){b.disabled=false;b.textContent='自动安装';}",
                     );
                 }
@@ -487,6 +441,16 @@ fn main() -> wry::Result<()> {
                         exit_application(&bootstrap_control, &managed_process, control_flow)
                     }
                     Some(DesktopAction::Show) | None => {}
+                }
+            }
+            Event::WindowEvent {
+                window_id,
+                event: WindowEvent::Resized(_size),
+                ..
+            } => {
+                if desktop.window.id() == window_id {
+                    // 在 Windows 上强制窗口重绘以更新 WebView 边界
+                    desktop.window.request_redraw();
                 }
             }
             _ => {}
@@ -519,7 +483,8 @@ fn open_desktop(
     let mut web_context = WebContext::new(Some(webview_data_directory(Path::new(&local_app_data))));
     let main_proxy = proxy.clone();
     let webview = WebViewBuilder::new_with_web_context(&mut web_context)
-        .with_visible(false)
+        .with_visible(true)
+        .with_html(build_splash_html())
         .with_ipc_handler(move |request| match request.body().as_str() {
             "retry" => {
                 let _ = main_proxy.send_event(UserEvent::Retry);
@@ -553,8 +518,8 @@ fn open_desktop(
             }
             _ => {}
         })
+        .with_initialization_script(auth_cover_script())
         .with_on_page_load_handler(move |event, url| {
-            // event: PageLoadEvent (Started/Finished), url: String
             if let wry::PageLoadEvent::Finished = event {
                 if url == DSH_URL || url.starts_with("http://127.0.0.1:3080") {
                     let _ = nav_proxy.send_event(UserEvent::PageLoaded(url));
@@ -563,33 +528,6 @@ fn open_desktop(
         })
         .build(&window)
         .map_err(|error| format!("创建主 WebView 失败: {error}"))?;
-
-    let splash_proxy = proxy.clone();
-    let splash_webview = WebViewBuilder::new_with_web_context(&mut web_context)
-        .with_html(build_splash_html())
-        .with_ipc_handler(move |request| match request.body().as_str() {
-            "retry" => {
-                let _ = splash_proxy.send_event(UserEvent::Retry);
-            }
-            "exit" => {
-                let _ = splash_proxy.send_event(UserEvent::Exit);
-            }
-            "update-dsh" => {
-                let _ = splash_proxy.send_event(UserEvent::InstallDshUpdate);
-            }
-            "dismiss-dsh-update" => {
-                let _ = splash_proxy.send_event(UserEvent::DismissDshUpdate);
-            }
-            "install-node" => {
-                let _ = splash_proxy.send_event(UserEvent::InstallNode);
-            }
-            "install-dsh" => {
-                let _ = splash_proxy.send_event(UserEvent::InstallDsh);
-            }
-            _ => {}
-        })
-        .build(&window)
-        .map_err(|error| format!("创建启动遮罩失败: {error}"))?;
 
     let icon = tray_icon()?;
     let menu = Menu::new();
@@ -610,7 +548,6 @@ fn open_desktop(
     Ok(DesktopState {
         window,
         webview,
-        splash_webview,
         _web_context: web_context,
         _tray: tray,
     })
@@ -623,22 +560,6 @@ fn navigation_script(target: &str) -> String {
 
 fn page_navigation_target(authenticated_url: Option<&str>) -> &str {
     authenticated_url.unwrap_or(DSH_URL)
-}
-
-fn should_retry_auth_page(text: &str, attempts: u8) -> bool {
-    attempts == 0
-        && text
-            .to_ascii_lowercase()
-            .contains("authentication required")
-}
-
-fn auth_retry_matches_session(state: Option<&AuthRetryState>, session: u64) -> bool {
-    state.is_some_and(|state| state.session == session)
-}
-
-fn should_hide_startup_overlay(text: &str) -> bool {
-    let normalized = text.to_ascii_lowercase();
-    !normalized.is_empty() && !normalized.contains("authentication required")
 }
 
 fn update_action(install_ok: bool, validation_ok: bool) -> UpdateAction {
@@ -909,41 +830,10 @@ mod tests {
     }
 
     #[test]
-    fn authentication_failure_is_retried_once() {
-        assert!(should_retry_auth_page("dsh web authentication required", 0));
-        assert!(!should_retry_auth_page(
-            "dsh web authentication required",
-            1
-        ));
-        assert!(!should_retry_auth_page("DeepSeek web app", 0));
-    }
-
-    #[test]
-    fn auth_retry_events_match_only_their_session() {
-        let state = AuthRetryState {
-            session: 2,
-            url: "http://127.0.0.1:3080/?token=abc".into(),
-            attempts: 0,
-        };
-        assert!(auth_retry_matches_session(Some(&state), 2));
-        assert!(!auth_retry_matches_session(Some(&state), 1));
-        assert!(!auth_retry_matches_session(None, 2));
-    }
-
-    #[test]
     fn dsh_update_restarts_only_after_install_and_validation() {
         assert_eq!(update_action(true, true), UpdateAction::Restart);
         assert_eq!(update_action(false, true), UpdateAction::FailInstall);
         assert_eq!(update_action(true, false), UpdateAction::FailValidation);
-    }
-
-    #[test]
-    fn startup_overlay_hides_only_after_authenticated_page_load() {
-        assert!(!should_hide_startup_overlay(
-            "dsh web authentication required"
-        ));
-        assert!(!should_hide_startup_overlay(""));
-        assert!(should_hide_startup_overlay("DeepSeek Harness"));
     }
 
     #[cfg(windows)]

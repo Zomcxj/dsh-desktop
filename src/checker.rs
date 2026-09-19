@@ -33,6 +33,87 @@ pub fn http_ready(host: &str, port: u16, timeout: Duration) -> bool {
         .is_some_and(|status| status.starts_with("HTTP/"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCookie {
+    pub name: String,
+    pub value: String,
+}
+
+/// GET token URL in the background and capture the HttpOnly session cookie.
+/// Returns the cookie only when dsh replies with 303 + Set-Cookie.
+pub fn exchange_auth_cookie(url: &str, timeout: Duration) -> Option<SessionCookie> {
+    let (host, port, path) = parse_local_http_url(url)?;
+    let addr: SocketAddr = format!("{host}:{port}").parse().ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+
+    let mut response = Vec::new();
+    let mut buffer = [0; 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                response.extend_from_slice(&buffer[..count]);
+                if response.len() > 16 * 1024 {
+                    break;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+
+    parse_session_cookie(std::str::from_utf8(&response).ok()?)
+}
+
+fn parse_local_http_url(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.strip_prefix("http://")?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host.to_string(), port.parse().ok()?),
+        None => (authority.to_string(), 80),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port, format!("/{path}")))
+}
+
+fn parse_session_cookie(response: &str) -> Option<SessionCookie> {
+    let mut lines = response.split("
+");
+    let status = lines.next()?;
+    if !status.starts_with("HTTP/1.1 303") && !status.starts_with("HTTP/1.0 303") {
+        return None;
+    }
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':')?;
+        if !name.eq_ignore_ascii_case("set-cookie") {
+            continue;
+        }
+        let cookie = value.trim();
+        let pair = cookie.split(';').next()?.trim();
+        let (cookie_name, cookie_value) = pair.split_once('=')?;
+        if cookie_name.is_empty() || cookie_value.is_empty() {
+            continue;
+        }
+        return Some(SessionCookie {
+            name: cookie_name.to_string(),
+            value: cookie_value.to_string(),
+        });
+    }
+    None
+}
+
 #[cfg(windows)]
 pub fn close_tcp_listeners(port: u16) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
@@ -157,5 +238,67 @@ mod tests {
             listening_pids_from_netstat(output, 3080, 5678),
             vec![4123, 9000]
         );
+    }
+
+    #[test]
+    fn parse_local_http_url_keeps_token_query() {
+        assert_eq!(
+            parse_local_http_url("http://127.0.0.1:3080/?token=abc"),
+            Some(("127.0.0.1".into(), 3080, "/?token=abc".into()))
+        );
+    }
+
+    #[test]
+    fn parse_session_cookie_requires_303_and_set_cookie() {
+        let response = "HTTP/1.1 303 See Other
+set-cookie: dsh.abc=v1.payload.sig; Max-Age=86400; Path=/; HttpOnly; SameSite=Strict
+location: /
+
+";
+        assert_eq!(
+            parse_session_cookie(response),
+            Some(SessionCookie {
+                name: "dsh.abc".into(),
+                value: "v1.payload.sig".into(),
+            })
+        );
+        assert!(parse_session_cookie("HTTP/1.1 401 Unauthorized
+
+").is_none());
+    }
+
+    #[test]
+    fn exchange_auth_cookie_captures_set_cookie_from_303() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 256];
+            let count = stream.read(&mut request).unwrap();
+            let text = std::str::from_utf8(&request[..count]).unwrap();
+            assert!(text.starts_with("GET /?token=abc HTTP/1.1
+"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 303 See Other
+set-cookie: dsh.abc=v1.payload.sig; Path=/; HttpOnly
+location: /
+
+",
+                )
+                .unwrap();
+        });
+
+        assert_eq!(
+            exchange_auth_cookie(
+                &format!("http://127.0.0.1:{port}/?token=abc"),
+                Duration::from_millis(500)
+            ),
+            Some(SessionCookie {
+                name: "dsh.abc".into(),
+                value: "v1.payload.sig".into(),
+            })
+        );
+        server.join().unwrap();
     }
 }

@@ -354,6 +354,33 @@ pub fn apply_msg(webview: &wry::WebView, message: &UiMsg) -> bool {
     webview.evaluate_script(&ui_msg_js(message)).is_ok()
 }
 
+/// Cover the dsh auth page until the authenticated app document is present.
+pub fn auth_cover_script() -> &'static str {
+    r#"(function(){
+  var isLocal = location.hostname === '127.0.0.1' && String(location.port) === '3080';
+  if (!isLocal) return;
+  var text = ((document.body && document.body.innerText) || '') + ' ' + (document.title || '');
+  var isAuth = /authentication required/i.test(text);
+  var isApp = !isAuth && !!document.getElementById('root');
+  var cover = document.getElementById('dsh-auth-cover');
+  if (isApp) {
+    if (cover && cover.parentNode) cover.parentNode.removeChild(cover);
+    return;
+  }
+  if (!cover) {
+    cover = document.createElement('div');
+    cover.id = 'dsh-auth-cover';
+    cover.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:#000;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:Segoe UI,system-ui,sans-serif;';
+    cover.innerHTML = '<div style="width:22px;height:22px;margin-bottom:16px;border:3px solid #303030;border-top-color:#4d6bfe;border-radius:50%;animation:dshspin .8s linear infinite"></div><div style="font-size:13px">正在进入主界面...</div><style>@keyframes dshspin{to{transform:rotate(360deg)}}</style>';
+    (document.documentElement || document.body).appendChild(cover);
+  }
+  if (isAuth && !window.__dshAuthReloaded) {
+    window.__dshAuthReloaded = true;
+    setTimeout(function(){ location.replace('http://127.0.0.1:3080/'); }, 50);
+  }
+})();"#
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +403,7 @@ mod tests {
         let html = build_splash_html();
         assert!(html.contains("update-dsh"));
         assert!(html.contains("showUpdateFail"));
+        assert!(auth_cover_script().contains("dsh-auth-cover"));
         let navbar = inject_navbar_script();
         assert!(navbar.contains("无脑进入"));
         assert!(navbar.contains("dismiss-dsh-update"));
